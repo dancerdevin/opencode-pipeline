@@ -63,8 +63,10 @@ const AGENTS = [
 ];
 
 function agentFileContent({ description, permission }, promptBody) {
+  // JSON.stringify keeps the description a valid YAML double-quoted scalar
+  // (plain scalars can't contain ": ", which these descriptions do).
   return `---
-description: ${description}
+description: ${JSON.stringify(description)}
 mode: primary
 permission:
 ${permission}

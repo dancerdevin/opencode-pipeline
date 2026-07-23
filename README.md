@@ -79,8 +79,9 @@ node setup.mjs
 `setup.mjs` writes the three agents as markdown files into
 `~/.config/opencode/agents/` (honoring `XDG_CONFIG_HOME`). It backs up any
 pre-existing same-named file it didn't write, and `node setup.mjs --uninstall`
-removes exactly what it installed. If you'd rather inspect first, run it once
-into a scratch config home: `XDG_CONFIG_HOME=$(mktemp -d) node setup.mjs`.
+removes exactly what it installed (restoring any backup). If you'd rather
+inspect first, run it once into a scratch config home:
+`XDG_CONFIG_HOME=$(mktemp -d) node setup.mjs`.
 
 **Restart any running `opencode serve` (and TUI) afterward** — agents are loaded
 at startup. If your global `opencode.json`/`opencode.jsonc` already defines
@@ -167,6 +168,8 @@ Do not commit, push, or change git branches."
 
 ### 4. Run the pipeline against the checkout
 
+From your `opencode-pipeline` clone:
+
 ```bash
 export PIPELINE_SERVER_URL=http://127.0.0.1:4747
 node run-pipeline.mjs "$TASK" ~/src/widgets
@@ -237,7 +240,7 @@ match.
 |-----------------------------------|-----------------|---------|
 | `PIPELINE_SERVER_URL`             | *(unset)*       | Attach to an already-running server at this URL; skip spawn/teardown. |
 | `PIPELINE_SERVER_PORT`            | `4747`          | Port for the server the script spawns (ignored if `PIPELINE_SERVER_URL` is set). |
-| `PIPELINE_CONFIG`                 | `./pipeline.config.json` | Path to the pipeline config file. |
+| `PIPELINE_CONFIG`                 | `pipeline.config.json` next to the scripts | Path to the pipeline config file. |
 | `PIPELINE_STAGE_TIMEOUT_MS`       | `1800000` (30m) | How long a single stage may run before timing out. Generous because you may take time to approve. |
 | `PIPELINE_PERMISSION_POLL_MS`     | `3000`          | How often the pipeline polls the server for pending approval asks while a stage runs. |
 | `PIPELINE_PERMISSION_REMINDER_MS` | `30000`         | How often an unanswered ask is re-announced in the pipeline's output. |

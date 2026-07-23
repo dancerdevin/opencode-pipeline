@@ -9,8 +9,10 @@
 // pricing (see resolve-model.mjs); tiers, stage→tier mapping, and the retry
 // cap live in pipeline.config.json.
 import { spawn } from 'node:child_process';
+import { realpathSync } from 'node:fs';
 import path from 'node:path';
 import readline from 'node:readline';
+import { pathToFileURL } from 'node:url';
 import { fetchPricing, resolveTierModel, loadConfig } from './resolve-model.mjs';
 
 const DEFAULT_SERVER_PORT = 4747;
@@ -493,7 +495,10 @@ async function main() {
   process.exit(exitCode);
 }
 
-const isMain = process.argv[1] && import.meta.url === `file://${process.argv[1]}`;
+// True when this file is the entry point, including via a bin symlink (npm
+// installs one; realpath resolves it) or from a path containing spaces
+// (pathToFileURL percent-encodes the way import.meta.url does).
+const isMain = process.argv[1] && import.meta.url === pathToFileURL(realpathSync(process.argv[1])).href;
 if (isMain) {
   main().catch((err) => {
     console.error(`Pipeline failed: ${err.message}`);

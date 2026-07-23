@@ -2,7 +2,8 @@
 // Picks the cheapest model in a caller-maintained tier from pipeline.config.json,
 // ranked against OpenRouter's live per-token pricing (not hardcoded prices).
 import { readFile } from 'node:fs/promises';
-import { fileURLToPath } from 'node:url';
+import { realpathSync } from 'node:fs';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import path from 'node:path';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -85,7 +86,8 @@ export function resolveTierModel(tier, tiers, pricingMap) {
   };
 }
 
-const isMain = process.argv[1] && import.meta.url === `file://${process.argv[1]}`;
+// Entry-point check that survives bin symlinks and paths with spaces.
+const isMain = process.argv[1] && import.meta.url === pathToFileURL(realpathSync(process.argv[1])).href;
 if (isMain) {
   const tier = process.argv[2];
   if (!tier) {
