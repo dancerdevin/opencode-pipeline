@@ -1,0 +1,34 @@
+{
+  "name": "opencode-pipeline",
+  "version": "0.1.0",
+  "description": "Cost-aware plan -> execute -> review pipeline over OpenCode + OpenRouter, with live human approval of shell commands",
+  "type": "module",
+  "bin": {
+    "opencode-pipeline": "./run-pipeline.mjs"
+  },
+  "scripts": {
+    "setup": "node setup.mjs",
+    "test": "node --test"
+  },
+  "files": [
+    "run-pipeline.mjs",
+    "resolve-model.mjs",
+    "setup.mjs",
+    "pipeline.config.json",
+    "prompts/"
+  ],
+  "keywords": [
+    "opencode",
+    "openrouter",
+    "llm",
+    "ai-agents",
+    "multi-agent",
+    "code-review",
+    "pipeline",
+    "cost-aware"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "license": "MIT"
+}
