@@ -42,7 +42,9 @@ After editing `prompts/`: re-run `node setup.mjs` **and restart any running
 - **Review sentinel contract.** `prompts/review.txt` owns the
   `REVIEW_RESULT: PASS` / `REVIEW_RESULT: FAIL: <reason>` format. The
   orchestrator parses it with a regex and takes the **last** match; a missing
-  sentinel counts as FAIL. Edit the prompt's wording around it carefully.
+  sentinel counts as FAIL. Anything the reviewer writes before the sentinel is
+  printed to the operator verbatim (the notes lane) — keep the sentinel itself
+  on the final line. Edit the prompt's wording around it carefully.
 - **Agent names.** `run-pipeline.mjs` maps stages to agents named exactly
   `pipeline-plan`, `pipeline-execute`, `pipeline-review` (`AGENT_BY_STAGE`).
   `setup.mjs`, the prompts, and any inline server config must agree.
@@ -64,12 +66,17 @@ After editing `prompts/`: re-run `node setup.mjs` **and restart any running
 ### Preflight
 
 1. Server up: `curl http://127.0.0.1:<port>/global/health`.
-2. Agents present on that server:
+2. Server is **fresh**. Agents load at server startup, so a server started
+   before the last `setup.mjs` run or `opencode.jsonc` edit silently serves
+   yesterday's prompts. Compare the process start time against the agent file
+   mtimes: `ps -o lstart= -p <serve-pid>` vs
+   `ls -l ~/.config/opencode/agents/`. Restart the server if it's older.
+3. Agents present on that server:
    `curl "http://127.0.0.1:<port>/agent?directory=<target-dir>"` — must list
    `pipeline-plan/-execute/-review`. They can come from `setup.mjs` *or* an
    inline `agent` block in the server's `opencode.json(c)`; either way the
    server must have been (re)started after they were defined.
-3. Target repo on a **clean feature branch**. The execute agent edits the
+4. Target repo on a **clean feature branch**. The execute agent edits the
    working tree in place; the pipeline never branches, commits, pushes, or
    opens PRs — that is the supervisor's job before and after the run.
 
@@ -87,10 +94,16 @@ per-stage timeout is 30 min (`PIPELINE_STAGE_TIMEOUT_MS`) to allow for slow
 human approvals. Exit code is 0 on PASS, 1 on FAIL.
 
 Only the **execute** stage can prompt for approval (plan/review deny bash+edit
-and never prompt). A list of read-only commands (`ls`, `grep`, `git diff`, …)
-is pre-approved; note that **compound commands joined with `;` or `|` don't
-match those patterns** and fall through to "ask" even when every part is
-read-only — approving them is safe.
+and never prompt). Two command groups are pre-approved (see `EXECUTE_BASH_ALLOW`
+in `setup.mjs`): read-only inspection (`ls`, `grep`, `git diff`, …) and local
+verification tools (`pytest`, `ruff`, `npx tsc`, `npm test`, …). The second
+group is safe because execute already holds `edit: allow` — gating whether it
+may *run* the project's own checks adds little; installs, network calls, and
+git mutations still ask. Compound commands are split into per-part patterns by
+recent opencode (observed on 1.18.4: an ask lists each part, and "always"
+allow-lists each part separately), so a compound whose parts are all
+pre-approved never prompts. An ask for a compound of individually benign parts
+is safe to approve.
 
 ### Answering permission asks over the API
 
@@ -133,13 +146,24 @@ recent activity via `GET /session/<id>/message?directory=<dir>`.
 
 ### After the run
 
-- PASS/FAIL plus a per-stage cost table print at the end; FAIL retries appear
-  as `execute-retryN` / `review-retryN` rows, capped by `maxRetries`.
+- The review stage's full findings print after its verdict, then PASS/FAIL
+  plus a per-stage cost table at the end; FAIL retries appear as
+  `execute-retryN` / `review-retryN` rows, capped by `maxRetries`.
+- **Triage the review findings before committing.** The notes lane produces
+  claims too — verify each against the code before acting on it. (In the #135
+  run, one of three notes was a false positive: the query options it flagged
+  matched the reference component exactly, and "fixing" them would have made
+  the code *less* consistent.) Implement clearly-valid small fixes directly on
+  the same branch, re-run the gates, and fold them into the same PR; flag
+  anything larger or judgment-dependent for the human instead of growing the
+  diff.
 - A pipeline PASS is a strong signal, **not** a substitute for review: read the
   diff yourself, re-run the project's gates yourself, then commit/push/PR if
   that is part of your mandate. Fetch issue/task context up front
   (e.g. `gh issue view`) so the task string names exact files, limits, and
-  verification commands — precise tasks produce dramatically better runs.
+  verification commands — including exact runner paths when they aren't on
+  `PATH` (e.g. `env/bin/pytest`), which pre-empts the venv-hunting failure
+  mode under *Steering* above. Precise tasks produce dramatically better runs.
 - Costs are real OpenRouter spend; the summary is the receipt.
 
 ## Style

@@ -20,13 +20,22 @@ const MARKER = '<!-- managed by opencode-pipeline setup.mjs -->';
 const CONFIG_HOME = process.env.XDG_CONFIG_HOME || path.join(os.homedir(), '.config');
 const AGENTS_DIR = path.join(CONFIG_HOME, 'opencode', 'agents');
 
-// Read-only inspection commands the execute stage may run without asking;
-// anything that writes, builds, tests, or touches git state still falls through
-// to "ask". (Last matching rule wins, so the broad "ask" stays first.)
+// Commands the execute stage may run without asking, in two groups: read-only
+// inspection, and local verification tools (test runners, linters, type
+// checks). The second group is justified by execute already holding
+// edit: allow — it can write arbitrary code into the repo, so gating whether
+// it may also *run* the project's own checks adds little. Anything that
+// installs packages, touches the network, or mutates git state still falls
+// through to "ask". (Last matching rule wins, so the broad "ask" stays first.)
 const EXECUTE_BASH_ALLOW = [
+  // Read-only inspection
   'cat*', 'head*', 'tail*', 'ls*', 'pwd', 'cd*', 'wc*', 'file*',
-  'grep*', 'rg*', 'sed -n*', 'jq*',
+  'grep*', 'rg*', 'sed -n*', 'jq*', 'echo*',
   'git status*', 'git diff*', 'git log*', 'git show*',
+  // Local verification — including venv-prefixed forms like env/bin/pytest
+  'pytest*', '*/bin/pytest*', 'ruff*', '*/bin/ruff*',
+  'npx tsc*', 'npx vitest*', 'npx eslint*', 'vitest*',
+  'npm test*', 'npm run test*', 'npm run lint*', 'node --test*',
 ];
 
 const READ_ONLY_PERMISSION = ['  read: allow', '  edit: deny', '  bash: deny'].join('\n');
@@ -50,7 +59,7 @@ const AGENTS = [
     name: 'pipeline-execute',
     promptFile: 'execute.txt',
     description:
-      'Execute stage of opencode-pipeline: carries out the plan; edits allowed, bash commands require approval.',
+      'Execute stage of opencode-pipeline: carries out the plan; edits allowed, read-only and verification commands pre-approved, other bash requires approval.',
     permission: EXECUTE_PERMISSION,
   },
   {

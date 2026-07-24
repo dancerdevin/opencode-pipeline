@@ -8,12 +8,15 @@
 // human approval. Per-stage model tier is resolved against live OpenRouter
 // pricing (see resolve-model.mjs); tiers, stage→tier mapping, and the retry
 // cap live in pipeline.config.json.
-import { spawn } from 'node:child_process';
+import { execFile, spawn } from 'node:child_process';
 import { realpathSync } from 'node:fs';
 import path from 'node:path';
 import readline from 'node:readline';
+import { promisify } from 'node:util';
 import { pathToFileURL } from 'node:url';
 import { fetchPricing, resolveTierModel, loadConfig } from './resolve-model.mjs';
+
+const execFileAsync = promisify(execFile);
 
 const DEFAULT_SERVER_PORT = 4747;
 const READINESS_TIMEOUT_MS = 10_000;
@@ -23,6 +26,9 @@ const STAGE_TIMEOUT_MS = Number(process.env.PIPELINE_STAGE_TIMEOUT_MS) || 30 * 6
 // often it re-announces an ask that stays unanswered.
 const PERMISSION_POLL_INTERVAL_MS = Number(process.env.PIPELINE_PERMISSION_POLL_MS) || 3_000;
 const PERMISSION_REMINDER_INTERVAL_MS = Number(process.env.PIPELINE_PERMISSION_REMINDER_MS) || 30_000;
+// How much of the working-tree diff to embed in the review prompt before
+// truncating (the reviewer can read the full files for anything cut off).
+const REVIEW_DIFF_MAX_CHARS = 100_000;
 
 const AGENT_BY_STAGE = {
   plan: 'pipeline-plan',
@@ -304,6 +310,40 @@ async function runStage({ serverUrl, agent, model, dir, prompt, stageLabel }) {
   return getStageResult(serverUrl, sessionId);
 }
 
+async function runGit(dir, args) {
+  const { stdout } = await execFileAsync('git', ['-C', dir, ...args], { maxBuffer: 32 * 1024 * 1024 });
+  return stdout.replace(/\n$/, '');
+}
+
+// Pure formatting for the working-tree state block embedded in the review
+// prompt. Exported for tests.
+function formatWorkingTreeState(status, diff) {
+  let body = diff;
+  let truncated = '';
+  if (body.length > REVIEW_DIFF_MAX_CHARS) {
+    body = body.slice(0, REVIEW_DIFF_MAX_CHARS);
+    truncated = `\n[diff truncated at ${REVIEW_DIFF_MAX_CHARS} chars — read the affected files in full]`;
+  }
+  return (
+    `$ git status --porcelain\n${status || '(clean)'}\n\n` +
+    `$ git diff HEAD\n${body || '(no tracked changes — untracked files appear as ?? above; read them in full)'}${truncated}`
+  );
+}
+
+// Captures what the execute stage actually changed so the review stage judges
+// the diff itself rather than trusting the execute summary. The orchestrator
+// runs git itself because review runs with bash: deny and couldn't. git diff
+// misses untracked files, so status comes along and the review prompt tells
+// the reviewer to read ?? files in full. Best-effort: failures become notes
+// inside the block, not pipeline errors (a non-git target dir still works).
+async function collectWorkingTreeState(dir) {
+  const [status, diff] = await Promise.all([
+    runGit(dir, ['status', '--porcelain']).catch((e) => `(git status failed: ${e.message})`),
+    runGit(dir, ['diff', 'HEAD']).catch((e) => `(git diff failed: ${e.message})`),
+  ]);
+  return formatWorkingTreeState(status, diff);
+}
+
 function parseReviewResult(text) {
   const matches = [...text.matchAll(/REVIEW_RESULT:\s*(PASS|FAIL)(?::\s*(.*))?/g)];
   if (matches.length === 0) {
@@ -454,8 +494,10 @@ async function main() {
       console.log(`[execute] done (cost $${executeResult.cost.toFixed(6)})\n`);
 
       console.log(`[review] running ${resolved.review.model}${attempt > 0 ? ` (retry ${attempt})` : ''}...`);
+      const treeState = await collectWorkingTreeState(dir);
       const reviewPrompt =
-        `Task: ${task}\n\nPlan:\n${planResult.text}\n\nExecute stage summary:\n${executeResult.text}`;
+        `Task: ${task}\n\nPlan:\n${planResult.text}\n\nExecute stage summary:\n${executeResult.text}\n\n` +
+        `Working-tree state after execution (captured by the orchestrator):\n${treeState}`;
       const rawReview = await runStage({
         serverUrl,
         agent: AGENT_BY_STAGE.review,
@@ -468,6 +510,9 @@ async function main() {
       stageLog.push({ stage: `review${attempt > 0 ? `-retry${attempt}` : ''}`, model: resolved.review.model, cost: rawReview.cost });
       reviewResult = parseReviewResult(rawReview.text);
       console.log(`[review] done (cost $${rawReview.cost.toFixed(6)}) -> ${reviewResult.verdict}\n`);
+      // The verdict used to be all the operator saw; print the reviewer's full
+      // findings so notes that don't rise to FAIL still reach a human.
+      console.log(`--- review findings ---\n${rawReview.text.trim()}\n-----------------------\n`);
 
       if (reviewResult.verdict === 'PASS') break;
       if (attempt >= config.maxRetries) break;
@@ -508,4 +553,4 @@ if (isMain) {
 
 // Exported for tests (and potential reuse); running this file directly still
 // executes the pipeline via the isMain guard above.
-export { startPermissionWatchdog, listPendingPermissions, permissionReplyCommand, parseReviewResult };
+export { startPermissionWatchdog, listPendingPermissions, permissionReplyCommand, parseReviewResult, formatWorkingTreeState, collectWorkingTreeState };

@@ -11,11 +11,16 @@ OpenCode TUI for you to approve or reject as they happen.
 - **plan** — a *smart*-tier model reads the repo (read-only) and writes an ordered
   implementation plan.
 - **execute** — a *cheap*-tier model carries out the plan: edits files and runs
-  commands. **Every `bash` command pauses for your approval** (read-only inspection
-  commands like `ls`, `grep`, `git diff` are pre-approved).
-- **review** — a *very-smart*-tier model inspects the actual diff (read-only) and
-  emits `REVIEW_RESULT: PASS` or `REVIEW_RESULT: FAIL: <reason>`. On FAIL the
-  execute stage retries with the reason folded in, up to `maxRetries` times.
+  commands. **`bash` commands pause for approval**, except pre-approved
+  read-only inspection (`ls`, `grep`, `git diff`, …) and local verification
+  tools (`pytest`, `ruff`, `npx tsc`, `npm test`, …); installs, network calls,
+  and git mutations always ask.
+- **review** — a *very-smart*-tier model verifies the work against the actual
+  diff: the orchestrator captures `git status` + `git diff HEAD` into the
+  review prompt (review itself is read-only, no shell). Its full findings print
+  to the log, and it emits `REVIEW_RESULT: PASS` or `REVIEW_RESULT: FAIL:
+  <reason>`. On FAIL the execute stage retries with the reason folded in, up
+  to `maxRetries` times.
 
 The pipeline exits `0` on PASS, `1` on FAIL, and prints a per-stage cost summary.
 
@@ -56,7 +61,7 @@ permissions:
 | Agent              | read  | edit  | bash                                     |
 |--------------------|-------|-------|------------------------------------------|
 | `pipeline-plan`    | allow | deny  | deny                                     |
-| `pipeline-execute` | allow | allow | **ask** (read-only commands pre-approved)|
+| `pipeline-execute` | allow | allow | **ask** (read-only + test/lint commands pre-approved)|
 | `pipeline-review`  | allow | deny  | deny                                     |
 
 Only execute can ever prompt you. Plan and review are read-only and run without
@@ -182,7 +187,7 @@ node run-pipeline.mjs "$TASK" ~/src/widgets
   a build, the TUI shows the exact command and waits. Approve the ones you
   expect; reject anything that looks wrong (a rejection is fed back to the agent
   as feedback, not a crash).
-- **review** runs read-only and returns PASS/FAIL.
+- **review** runs read-only, prints its findings, and returns PASS/FAIL.
 
 ### 6. Inspect, then ship it yourself
 
@@ -255,6 +260,10 @@ match.
 [review] running openrouter/anthropic/claude-fable-5...
 [review] done (cost $0.008430) -> PASS
 
+--- review findings ---
+(the reviewer's full notes and reasoning, verbatim)
+-----------------------
+
 --- Pipeline summary ---
   plan             openrouter/moonshotai/kimi-k3          $0.010214
   execute          openrouter/anthropic/claude-sonnet-5   $0.031755
@@ -264,6 +273,8 @@ match.
 ```
 
 - A FAIL retry appears as extra `execute-retry1` / `review-retry1` rows.
+- The review stage's full findings print verbatim after its verdict — notes
+  that don't rise to FAIL land there, so read them even on a PASS.
 - Exit code is `0` for PASS, `1` for FAIL — usable in a shell `&&` chain.
 
 ## Notes & gotchas
@@ -289,7 +300,9 @@ match.
   shows nothing, answer it with the API command and re-attach the TUI.
 - **Branch before running.** The execute agent edits your working tree directly.
   It's told not to touch git, but you own that guarantee — start from a clean
-  feature branch so `git diff` shows exactly what it did.
+  feature branch so `git diff` shows exactly what it did. The reviewer's diff
+  view is captured from git too — a non-git target gets a weaker, files-only
+  review.
 - **Rejecting a command isn't fatal.** A rejection in the TUI is returned to the
   agent as a failed tool call; it will adapt. Use it to steer.
 - **Each stage is a fresh session** with no memory of the others — context is

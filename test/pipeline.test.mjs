@@ -1,11 +1,15 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
 import { mkdtemp, writeFile, rm } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 
-import { parseReviewResult, permissionReplyCommand } from '../run-pipeline.mjs';
+import { parseReviewResult, permissionReplyCommand, formatWorkingTreeState, collectWorkingTreeState } from '../run-pipeline.mjs';
 import { loadConfig, resolveTierModel } from '../resolve-model.mjs';
+
+const execFileAsync = promisify(execFile);
 
 test('parseReviewResult: clean PASS', () => {
   const { verdict, reason } = parseReviewResult('Looks good.\nREVIEW_RESULT: PASS');
@@ -40,6 +44,51 @@ test('parseReviewResult: last sentinel wins (FAIL after PASS)', () => {
   const { verdict, reason } = parseReviewResult('REVIEW_RESULT: PASS\nREVIEW_RESULT: FAIL: broke it');
   assert.equal(verdict, 'FAIL');
   assert.equal(reason, 'broke it');
+});
+
+test('formatWorkingTreeState: clean tree is explicit', () => {
+  const out = formatWorkingTreeState('', '');
+  assert.match(out, /\$ git status --porcelain\n\(clean\)/);
+  assert.match(out, /no tracked changes/);
+});
+
+test('formatWorkingTreeState: shows status and diff verbatim', () => {
+  const out = formatWorkingTreeState(' M a.js\n?? b.js', 'diff --git a/a.js b/a.js\n+line');
+  assert.match(out, / M a\.js\n\?\? b\.js/);
+  assert.match(out, /\$ git diff HEAD\ndiff --git/);
+});
+
+test('formatWorkingTreeState: oversized diff is truncated with a pointer', () => {
+  const out = formatWorkingTreeState(' M a.js', 'x'.repeat(200_000));
+  assert.ok(out.length < 200_000);
+  assert.match(out, /diff truncated at 100000 chars/);
+});
+
+test('collectWorkingTreeState: non-git dir yields an error note, not a throw', async () => {
+  const out = await collectWorkingTreeState('/nonexistent/pipeline-test-dir');
+  assert.match(out, /git status failed/);
+  assert.match(out, /git diff failed/);
+});
+
+test('collectWorkingTreeState: real repo shows modifications and untracked files', async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'pipeline-git-'));
+  try {
+    const git = (...args) => execFileAsync('git', ['-C', dir, ...args]);
+    await git('init');
+    await git('config', 'user.email', 'pipeline-test@example.com');
+    await git('config', 'user.name', 'Pipeline Test');
+    await writeFile(path.join(dir, 'a.txt'), 'one\n');
+    await git('add', '.');
+    await git('commit', '-m', 'init');
+    await writeFile(path.join(dir, 'a.txt'), 'one\ntwo\n');
+    await writeFile(path.join(dir, 'b.txt'), 'new\n');
+    const out = await collectWorkingTreeState(dir);
+    assert.match(out, / M a\.txt/);
+    assert.match(out, /\?\? b\.txt/);
+    assert.match(out, /\+two/);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
 });
 
 test('resolveTierModel: picks cheapest blended price, weighting completion 4x', () => {
