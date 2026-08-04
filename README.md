@@ -1,28 +1,38 @@
 # opencode-pipeline
 
-A cost-aware **plan → execute → review** pipeline over [OpenCode](https://opencode.ai)
-+ OpenRouter, with a human (you) approving every shell command live.
+A **plan → execute → review** pipeline over [OpenCode](https://opencode.ai),
+with a human (you) approving shell commands live. It has two public commands:
 
-Each stage runs as its own OpenCode session using a different model *tier*, and the
-cheapest model in each tier is chosen at runtime from OpenRouter's live pricing.
-You stay at the terminal: the execute stage's `bash` calls surface in an attached
-OpenCode TUI for you to approve or reject as they happen.
+- `opencode-pipeline` keeps the original cost-aware OpenRouter workflow. Each
+  stage uses a model tier, and the cheapest configured model in that tier is
+  selected from OpenRouter's live pricing.
+- `opencode-gpt-pipeline` uses a ChatGPT Plus/Pro subscription with fixed GPT
+  models: Terra for plan, Luna for execute, and Sol for review. It never queries
+  OpenRouter pricing and never falls back to an API key or another model.
 
-- **plan** — a *smart*-tier model reads the repo (read-only) and writes an ordered
-  implementation plan.
-- **execute** — a *cheap*-tier model carries out the plan: edits files and runs
+Both commands use the same OpenCode sessions, prompts, permission handling,
+diff-aware review, and retry loop. The execute stage's `bash` calls surface in
+an attached OpenCode TUI for you to approve or reject as they happen.
+
+- **plan** — reads the repo (read-only) and writes an ordered implementation
+  plan.
+- **execute** — carries out the plan: edits files and runs
   commands. **`bash` commands pause for approval**, except pre-approved
   read-only inspection (`ls`, `grep`, `git diff`, …) and local verification
   tools (`pytest`, `ruff`, `npx tsc`, `npm test`, …); installs, network calls,
   and git mutations always ask.
-- **review** — a *very-smart*-tier model verifies the work against the actual
+- **review** — verifies the work against the actual
   diff: the orchestrator captures `git status` + `git diff HEAD` into the
   review prompt (review itself is read-only, no shell). Its full findings print
   to the log, and it emits `REVIEW_RESULT: PASS` or `REVIEW_RESULT: FAIL:
-  <reason>`. On FAIL the execute stage retries with the reason folded in, up
-  to `maxRetries` times.
+  <reason>`. Plan and execute only hand off after explicit completion
+  sentinels. On FAIL, review sends a bounded `REQUIRED_FIXES` packet back to
+  the same execute session, preserving implementation context across up to
+  `maxRetries` retries.
 
-The pipeline exits `0` on PASS, `1` on FAIL, and prints a per-stage cost summary.
+The pipeline exits `0` on PASS and `1` on FAIL. OpenRouter runs print a
+per-stage dollar-cost receipt; GPT runs report the stage/model and `ChatGPT
+subscription allowance` without dollar costs.
 
 ## Why not just `openrouter/auto`?
 
@@ -46,10 +56,13 @@ it yourself.
 
 ```
 opencode-pipeline/
-├── run-pipeline.mjs      # orchestrator (entry point)
+├── run-pipeline.mjs      # shared orchestrator + OpenRouter entry point
+├── run-gpt-pipeline.mjs  # fixed-model ChatGPT subscription entry point
+├── config.mjs            # tiered/fixed config loading and validation
 ├── resolve-model.mjs     # cheapest-per-tier resolver against OpenRouter live pricing
 ├── setup.mjs             # installs the three pipeline agents into your opencode config
 ├── pipeline.config.json  # model tiers, stage → tier mapping, retry cap
+├── gpt-pipeline.config.json # fixed Terra/Luna/Sol mapping, subscription billing
 ├── prompts/              # stage system prompts (plan / execute / review)
 └── test/                 # node:test suite for the harness logic
 ```
@@ -69,8 +82,11 @@ interruption.
 
 ## Prerequisites
 
-- OpenCode installed (`opencode --version`) and logged in to OpenRouter
-  (`opencode providers login`).
+- OpenCode installed (`opencode --version`). OpenCode 1.18.5 is the tested
+  baseline; runtime capability checks, rather than a hardcoded version check,
+  decide whether GPT subscription mode can run.
+- OpenRouter credentials for `opencode-pipeline`, or ChatGPT Plus/Pro OAuth for
+  `opencode-gpt-pipeline` (setup below).
 - Node 20+ (`node --version`). There are no npm dependencies — the pipeline uses
   only the Node standard library.
 
@@ -92,6 +108,54 @@ inspect first, run it once into a scratch config home:
 at startup. If your global `opencode.json`/`opencode.jsonc` already defines
 `pipeline-*` agents inline, remove that block to avoid the definitions being
 merged.
+
+If installed as a package, the two binaries are:
+
+```bash
+opencode-pipeline "<task>" [target-dir]
+opencode-gpt-pipeline "<task>" [target-dir]
+```
+
+The source-checkout equivalents are `node run-pipeline.mjs` and `node
+run-gpt-pipeline.mjs`.
+
+## GPT subscription quickstart
+
+Authenticate OpenCode through ChatGPT OAuth, install the shared pipeline
+agents, and restart the server so it sees both the credentials and agents:
+
+```bash
+opencode auth login
+# Choose: OpenAI
+# Choose: ChatGPT Plus/Pro
+
+node setup.mjs
+opencode serve --port 4747
+```
+
+Attach a TUI in another terminal, then run the GPT command:
+
+```bash
+opencode attach http://127.0.0.1:4747
+
+PIPELINE_SERVER_URL=http://127.0.0.1:4747 \
+  opencode-gpt-pipeline "<task>" <target-dir>
+# From a source checkout: node run-gpt-pipeline.mjs "<task>" <target-dir>
+```
+
+Before creating any stage session, the GPT command queries OpenCode's
+`/provider` registry and requires all of the following:
+
+- `openai` is connected.
+- `openai/gpt-5.6-terra`, `openai/gpt-5.6-luna`, and
+  `openai/gpt-5.6-sol` are available.
+- Every model has present, zero-valued cost metadata, confirming
+  subscription-backed routing.
+
+If any check fails, the command exits with the OAuth steps above. OpenAI API-key
+authentication is intentionally rejected because it carries nonzero API
+pricing; there is no fallback to an API key, OpenRouter, or another model.
+Subscription usage remains subject to your ChatGPT plan's allowance and limits.
 
 ## Terminal setup
 
@@ -230,14 +294,40 @@ diff and a clean local test run before you open the PR.
   ```
 - `PIPELINE_CONFIG` points at a different config file if you keep several.
 
+Legacy tier configs without `modelStrategy` remain supported. Their normalized
+strategy is `tiered` and billing mode is `openrouter`.
+
+### Fixed GPT configuration
+
+`gpt-pipeline.config.json` is bundled with the package:
+
+```json
+{
+  "modelStrategy": "fixed",
+  "stageModels": {
+    "plan": "openai/gpt-5.6-terra",
+    "execute": "openai/gpt-5.6-luna",
+    "review": "openai/gpt-5.6-sol"
+  },
+  "billingMode": "chatgpt-subscription",
+  "maxRetries": 2
+}
+```
+
+Fixed configs require all three stages and cannot contain `tiers` or
+`stageTiers`; tiered configs cannot contain `stageModels`. The dedicated GPT
+command always uses this bundled file, so `PIPELINE_CONFIG` continues to affect
+the original OpenRouter command without changing GPT's fixed model contract.
+
 ### Prompts
 
 The stage system prompts are plain text in `prompts/`; `setup.mjs` embeds them
 into the installed agent files, so re-run `node setup.mjs` (and restart your
-server) after editing them. The **review** prompt owns the `REVIEW_RESULT: PASS`
-/ `REVIEW_RESULT: FAIL: <reason>` contract that drives the retry loop — edit it
-carefully; the orchestrator parses that sentinel with a regex and takes the last
-match.
+server) after editing them. Plan and execute own their `PLAN_RESULT` and
+`EXECUTE_RESULT` completion contracts. Review owns the `REVIEW_RESULT: PASS` /
+`REVIEW_RESULT: FAIL: <reason>` verdict and `REQUIRED_FIXES` repair packet that
+drive the retry loop. Edit these contracts carefully; the orchestrator parses
+their sentinels directly.
 
 ### Environment variables
 
@@ -277,6 +367,24 @@ match.
   that don't rise to FAIL land there, so read them even on a PASS.
 - Exit code is `0` for PASS, `1` for FAIL — usable in a shell `&&` chain.
 
+GPT mode reports allowance usage instead of a dollar receipt:
+
+```text
+[plan] running openai/gpt-5.6-terra...
+[plan] done (ChatGPT subscription allowance)
+[execute] running openai/gpt-5.6-luna...
+[execute] done (ChatGPT subscription allowance)
+[review] running openai/gpt-5.6-sol...
+[review] done (ChatGPT subscription allowance) -> PASS
+
+--- Pipeline summary ---
+  plan             openai/gpt-5.6-terra                     ChatGPT subscription allowance
+  execute          openai/gpt-5.6-luna                      ChatGPT subscription allowance
+  review           openai/gpt-5.6-sol                       ChatGPT subscription allowance
+  billing: ChatGPT subscription allowance
+  result: PASS
+```
+
 ## Notes & gotchas
 
 - **Approval asks are announced by the pipeline itself.** While a stage runs, the
@@ -305,12 +413,13 @@ match.
   review.
 - **Rejecting a command isn't fatal.** A rejection in the TUI is returned to the
   agent as a failed tool call; it will adapt. Use it to steer.
-- **Each stage is a fresh session** with no memory of the others — context is
-  passed explicitly (plan text into execute, plan + execute summary into
-  review). This is deliberate; don't expect cross-stage conversational
-  continuity.
-- **Cost is real.** Every run spends OpenRouter credit (typically a few cents
-  for a small issue). The summary is your receipt.
+- **Stages do not share conversational memory.** Context is passed explicitly
+  from plan to execute and from execute to review. Review attempts are fresh;
+  execute retries deliberately reuse one execute session so repair feedback
+  lands alongside the implementation conversation that produced the diff.
+- **Billing depends on the command.** OpenRouter runs spend OpenRouter credit
+  and print a receipt. GPT runs consume ChatGPT subscription allowance, remain
+  subject to plan limits, and intentionally omit dollar-cost reporting.
 - **Scope tasks tightly.** One issue per run. A vague or sprawling task produces
   a vague plan and a shakier review verdict.
 - **If a stage ever hangs** past when the TUI clearly shows it finished, Ctrl-C
@@ -332,11 +441,14 @@ Then delete the clone. Your OpenCode/OpenRouter login is untouched.
 
 ```bash
 node --test
+node --check run-pipeline.mjs
+node --check run-gpt-pipeline.mjs
 ```
 
 The harness's fiddly bits — review-sentinel parsing, tier resolution, config
-loading, permission reply commands — are unit-tested. Zero dependencies; please
-keep it that way unless a dependency earns its place.
+loading, fixed-model resolution, subscription preflight, billing output, and
+permission reply commands — are unit-tested. Zero dependencies; please keep it
+that way unless a dependency earns its place.
 
 ## License
 

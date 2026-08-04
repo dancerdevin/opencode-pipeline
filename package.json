@@ -1,10 +1,11 @@
 {
   "name": "opencode-pipeline",
-  "version": "0.1.0",
-  "description": "Cost-aware plan -> execute -> review pipeline over OpenCode + OpenRouter, with live human approval of shell commands",
+  "version": "0.2.0",
+  "description": "Plan -> execute -> review pipelines over OpenCode using OpenRouter pricing or a ChatGPT subscription",
   "type": "module",
   "bin": {
-    "opencode-pipeline": "./run-pipeline.mjs"
+    "opencode-pipeline": "./run-pipeline.mjs",
+    "opencode-gpt-pipeline": "./run-gpt-pipeline.mjs"
   },
   "scripts": {
     "setup": "node setup.mjs",
@@ -12,14 +13,19 @@
   },
   "files": [
     "run-pipeline.mjs",
+    "run-gpt-pipeline.mjs",
     "resolve-model.mjs",
+    "config.mjs",
     "setup.mjs",
     "pipeline.config.json",
+    "gpt-pipeline.config.json",
     "prompts/"
   ],
   "keywords": [
     "opencode",
     "openrouter",
+    "chatgpt",
+    "openai",
     "llm",
     "ai-agents",
     "multi-agent",

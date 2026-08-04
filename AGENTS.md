@@ -7,23 +7,31 @@ canonical user-facing doc; this file is the operator/maintainer cheat sheet.
 
 ## What this is
 
-A cost-aware **plan → execute → review** pipeline over OpenCode + OpenRouter.
-Each stage is a separate OpenCode session with its own model tier; the cheapest
-model per tier is resolved against OpenRouter's *live* pricing at runtime. The
-execute stage's `bash` calls surface in a human-attached TUI for live approval.
+A **plan → execute → review** pipeline over OpenCode with two public commands.
+`opencode-pipeline` keeps the cost-aware OpenRouter workflow: each stage uses a
+model tier resolved against *live* pricing. `opencode-gpt-pipeline` uses fixed
+Terra/Luna/Sol models through ChatGPT subscription authentication. Both share
+the same sessions, permissions, review, and retry machinery. The execute
+stage's `bash` calls surface in a human-attached TUI for live approval.
 
 Node 20+, **zero npm dependencies** (stdlib only). Keep it that way unless a
 dependency clearly earns its place.
 
 ## Layout
 
-- `run-pipeline.mjs` — orchestrator + entry point (also published as the
-  `opencode-pipeline` bin). Talks to `opencode serve` over HTTP, never the CLI.
+- `run-pipeline.mjs` — shared orchestrator + OpenRouter entry point (also
+  published as the `opencode-pipeline` bin). Talks to `opencode serve` over
+  HTTP, never the CLI.
+- `run-gpt-pipeline.mjs` — GPT subscription entry point, published as
+  `opencode-gpt-pipeline`.
+- `config.mjs` — loader/validator for tiered and fixed-model configurations.
 - `resolve-model.mjs` — cheapest-per-tier resolver (`node resolve-model.mjs <tier>`
   prints what would be picked right now).
 - `setup.mjs` — installs/uninstalls the three `pipeline-*` agents as markdown
   files under `~/.config/opencode/agents/` (honors `XDG_CONFIG_HOME`).
 - `pipeline.config.json` — tier lists, stage→tier mapping, `maxRetries`.
+- `gpt-pipeline.config.json` — fixed Terra/Luna/Sol mapping and subscription
+  billing mode; do not make it fall back to other providers or models.
 - `prompts/` — stage system prompts, embedded into the installed agents.
 - `test/pipeline.test.mjs` — `node:test` suite.
 
@@ -31,6 +39,8 @@ dependency clearly earns its place.
 
 ```bash
 node --test                 # full suite (also: npm test)
+node --check run-pipeline.mjs
+node --check run-gpt-pipeline.mjs
 node resolve-model.mjs smart   # sanity-check tier resolution against live pricing
 ```
 
@@ -45,6 +55,12 @@ After editing `prompts/`: re-run `node setup.mjs` **and restart any running
   sentinel counts as FAIL. Anything the reviewer writes before the sentinel is
   printed to the operator verbatim (the notes lane) — keep the sentinel itself
   on the final line. Edit the prompt's wording around it carefully.
+- **Plan/execute sentinel contracts.** Plan must end with `PLAN_RESULT: READY`
+  or `PLAN_RESULT: BLOCKED: <reason>`; execute must end with
+  `EXECUTE_RESULT: COMPLETE` or `EXECUTE_RESULT: BLOCKED: <reason>`. The
+  orchestrator does not advance an idle stage whose final line lacks its
+  sentinel. On review failure, every required repair belongs in the bounded
+  `REQUIRED_FIXES:` block; the summary after `FAIL:` is not the repair packet.
 - **Agent names.** `run-pipeline.mjs` maps stages to agents named exactly
   `pipeline-plan`, `pipeline-execute`, `pipeline-review` (`AGENT_BY_STAGE`).
   `setup.mjs`, the prompts, and any inline server config must agree.
@@ -57,6 +73,14 @@ After editing `prompts/`: re-run `node setup.mjs` **and restart any running
 - **HTTP API, not the `run` CLI.** Sessions created via the API surface their
   permission prompts in any attached TUI; `opencode run` auto-rejects its own
   `bash: ask` prompts when it has no TTY.
+- **GPT subscription preflight is fail-closed.** Before any GPT stage runs,
+  `/provider` must say `openai` is connected, all three configured models must
+  exist, and their cost metadata must be zero. Nonzero costs indicate API-key
+  routing and must be rejected. Never add an API-key, OpenRouter, or model
+  fallback to the GPT command.
+- **Billing output follows the mode.** OpenRouter runs keep per-stage and total
+  dollar receipts. GPT runs name each stage/model and say `ChatGPT subscription
+  allowance`; do not print dollar costs for GPT runs.
 - **setup.mjs symmetry.** Install never clobbers an unmarked same-named file
   (backs it up); `--uninstall` removes exactly what it installed (marker
   comment) and restores backups.
@@ -79,6 +103,10 @@ After editing `prompts/`: re-run `node setup.mjs` **and restart any running
 4. Target repo on a **clean feature branch**. The execute agent edits the
    working tree in place; the pipeline never branches, commits, pushes, or
    opens PRs — that is the supervisor's job before and after the run.
+5. For GPT mode, authenticate with `opencode auth login` → OpenAI → ChatGPT
+   Plus/Pro, run `node setup.mjs`, then restart the server. The GPT command
+   intentionally rejects OpenAI API-key authentication. Subscription use still
+   counts against the limits of the user's ChatGPT plan.
 
 ### Launch & watch
 
@@ -86,6 +114,9 @@ After editing `prompts/`: re-run `node setup.mjs` **and restart any running
 PIPELINE_SERVER_URL=http://127.0.0.1:<port> \
   nohup node run-pipeline.mjs "<task>" <target-dir> > /tmp/pipeline-run.log 2>&1 &
 ```
+
+Use `node run-gpt-pipeline.mjs` (or `opencode-gpt-pipeline` after package
+installation) for the fixed ChatGPT subscription route.
 
 With `PIPELINE_SERVER_URL` set, the script attaches to the existing server and
 does not spawn/tear one down (and skips the "press Enter" pause). Run it in the
@@ -126,9 +157,10 @@ Never "answer" via the TUI's prompt box: typed text queues as chat.
 
 ### Steering a stuck or confused stage
 
-Each stage is a fresh session, but you can queue a user message into the
-*current* stage session; it is processed before the session goes idle, so the
-pipeline incorporates it:
+Plan and each review attempt use fresh sessions. Execute retries reuse the
+original execute session so Luna retains its implementation context. You can
+queue a user message into the *current* stage session; it is processed before
+the session goes idle, so the pipeline incorporates it:
 
 ```bash
 # find the active session (most recently updated for that directory)
@@ -147,7 +179,8 @@ recent activity via `GET /session/<id>/message?directory=<dir>`.
 ### After the run
 
 - The review stage's full findings print after its verdict, then PASS/FAIL
-  plus a per-stage cost table at the end; FAIL retries appear as
+  plus a per-stage usage table at the end; OpenRouter shows dollar costs and
+  GPT mode shows ChatGPT subscription allowance. FAIL retries appear as
   `execute-retryN` / `review-retryN` rows, capped by `maxRetries`.
 - **Triage the review findings before committing.** The notes lane produces
   claims too — verify each against the code before acting on it. (In the #135
@@ -164,7 +197,8 @@ recent activity via `GET /session/<id>/message?directory=<dir>`.
   verification commands — including exact runner paths when they aren't on
   `PATH` (e.g. `env/bin/pytest`), which pre-empts the venv-hunting failure
   mode under *Steering* above. Precise tasks produce dramatically better runs.
-- Costs are real OpenRouter spend; the summary is the receipt.
+- OpenRouter costs are real spend; its summary is the receipt. GPT mode uses
+  the user's ChatGPT subscription allowance and remains subject to plan limits.
 
 ## Style
 

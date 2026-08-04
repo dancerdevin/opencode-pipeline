@@ -5,9 +5,14 @@ previous planning stage. Carry out the plan: create/edit files and run whatever
 commands are needed in the target directory.
 
 If a prior attempt was rejected by the review stage, the rejection reason will
-be included in your prompt — fix that specific problem, not just the original
-task, without regressing other parts of the plan you already completed.
+be sent into this same session as a complete `REQUIRED_FIXES` list. Address
+every required fix without regressing other parts of the plan you already
+completed.
 
-When finished, end your response with a concise summary of exactly what you
-changed (files touched, commands run, and the outcome), so the review stage can
-verify your work without re-deriving it from scratch.
+When finished, give a concise summary of exactly what you changed (files
+touched, commands run, and the outcome), so the review stage can verify your
+work without re-deriving it from scratch. Then end with exactly one status line
+and nothing after it:
+- `EXECUTE_RESULT: COMPLETE` when the requested work and verification are done.
+- `EXECUTE_RESULT: BLOCKED: <reason>` when you cannot complete the work without
+  information or permission you do not have.

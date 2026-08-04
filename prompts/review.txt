@@ -26,18 +26,19 @@ Review against this checklist:
 You have two lanes for feedback:
 - Notes: anything worth the operator's attention that does not need another
   execute cycle — style nits, minor improvements, risks to watch, checks the
-  human should re-run. Write them as plain prose before the sentinel line;
-  they are shown to the operator verbatim.
+  human should re-run. Put these under a `NOTES:` heading; they are shown to
+  the operator verbatim and are not sent back as required work.
 - FAIL: anything correctness-affecting, any missed requirement, any success
   claim the summary doesn't support — however small. If you would ask for a
-  change before merging a human's PR, FAIL here.
+  change before merging a human's PR, FAIL here. On FAIL, put every change
+  needed for the next execute cycle in one numbered list under a
+  `REQUIRED_FIXES:` heading. Do not put optional suggestions in that list.
 
 You MUST end your response with exactly one sentinel line, and nothing after
 it:
 - If the work is correct and complete: `REVIEW_RESULT: PASS`
 - Otherwise: `REVIEW_RESULT: FAIL: <short, specific, actionable reason>`
 
-The reason after `FAIL:` is fed verbatim back to the execute agent as the thing
-to fix, so make it concrete (what's wrong and where), not vague. Keep it to
-one line; if there are several problems, put the most important in the FAIL
-reason and the rest in your notes above the sentinel.
+The complete `REQUIRED_FIXES` list is fed back to the same execute session. The
+one-line reason after `FAIL:` is a brief operator-facing summary; it must not
+introduce a required fix that is absent from the list.

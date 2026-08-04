@@ -5,16 +5,18 @@
 // to a shared server (`opencode serve`) that a TUI (`opencode attach`) is also
 // watching. Sessions created directly via the HTTP API don't have that
 // problem: their permission prompts surface in any attached TUI for live
-// human approval. Per-stage model tier is resolved against live OpenRouter
-// pricing (see resolve-model.mjs); tiers, stage→tier mapping, and the retry
-// cap live in pipeline.config.json.
+// human approval. Model selection is configuration-driven: the original
+// command resolves tiered models against OpenRouter pricing, while the GPT
+// command supplies fixed subscription-backed models. All session, approval,
+// diff, review, and retry machinery is shared here.
 import { execFile, spawn } from 'node:child_process';
 import { realpathSync } from 'node:fs';
 import path from 'node:path';
 import readline from 'node:readline';
 import { promisify } from 'node:util';
 import { pathToFileURL } from 'node:url';
-import { fetchPricing, resolveTierModel, loadConfig } from './resolve-model.mjs';
+import { PIPELINE_STAGES, loadConfig } from './config.mjs';
+import { fetchPricing, resolveTierModel } from './resolve-model.mjs';
 
 const execFileAsync = promisify(execFile);
 
@@ -30,6 +32,16 @@ const PERMISSION_REMINDER_INTERVAL_MS = Number(process.env.PIPELINE_PERMISSION_R
 // truncating (the reviewer can read the full files for anything cut off).
 const REVIEW_DIFF_MAX_CHARS = 100_000;
 
+const CHATGPT_LOGIN_INSTRUCTIONS =
+  'This command requires ChatGPT subscription authentication and never falls back to an OpenAI API key, ' +
+  'OpenRouter, or another model.\n' +
+  'Authenticate and refresh OpenCode with:\n' +
+  '  1. Run: opencode auth login\n' +
+  '  2. Choose: OpenAI\n' +
+  '  3. Choose: ChatGPT Plus/Pro\n' +
+  '  4. Run: node setup.mjs\n' +
+  '  5. Restart opencode serve, then retry this command.';
+
 const AGENT_BY_STAGE = {
   plan: 'pipeline-plan',
   execute: 'pipeline-execute',
@@ -44,6 +56,142 @@ function splitModelId(model) {
 
 function extractErrorMessage(error) {
   return error?.data?.message || error?.message || JSON.stringify(error);
+}
+
+function subscriptionPreflightError(reasons) {
+  const detail = reasons.map((reason) => `  - ${reason}`).join('\n');
+  return new Error(`GPT subscription preflight failed:\n${detail}\n\n${CHATGPT_LOGIN_INSTRUCTIONS}`);
+}
+
+function costMetadataIssue(cost) {
+  if (!cost || typeof cost !== 'object' || Array.isArray(cost)) {
+    return 'cost metadata is missing';
+  }
+  for (const key of ['input', 'output']) {
+    if (!Number.isFinite(cost[key])) return `cost.${key} metadata is missing`;
+  }
+
+  const pricedFields = new Set(['input', 'output', 'read', 'write']);
+  const visit = (value, pathParts) => {
+    if (!value || typeof value !== 'object') return null;
+    for (const [key, child] of Object.entries(value)) {
+      const childPath = [...pathParts, key];
+      if (pricedFields.has(key)) {
+        if (!Number.isFinite(child)) return `${childPath.join('.')} is not numeric`;
+        if (child !== 0) return `${childPath.join('.')} is ${child}, not zero`;
+        continue;
+      }
+      const issue = visit(child, childPath);
+      if (issue) return issue;
+    }
+    return null;
+  };
+  return visit(cost, ['cost']);
+}
+
+// Validates the runtime provider registry instead of trusting an OpenCode
+// version number or local credential file. OpenCode exposes API-priced models
+// with nonzero cost metadata; ChatGPT OAuth rewrites subscription-backed model
+// costs to zero, which lets this command intentionally reject API-key routing.
+function validateChatGptSubscriptionProvider(registry, stageModels) {
+  const reasons = [];
+  if (!registry || typeof registry !== 'object') {
+    throw subscriptionPreflightError(['OpenCode returned a malformed provider registry']);
+  }
+  if (!Array.isArray(registry.connected) || !registry.connected.includes('openai')) {
+    reasons.push('OpenAI is not connected through OpenCode');
+  }
+
+  const openai = Array.isArray(registry.all) ? registry.all.find((provider) => provider?.id === 'openai') : null;
+  if (!openai) {
+    reasons.push('the OpenAI provider is missing from OpenCode\'s provider registry');
+  }
+
+  for (const stage of PIPELINE_STAGES) {
+    const fullModel = stageModels[stage];
+    const { providerID, modelID } = splitModelId(fullModel);
+    if (providerID !== 'openai') {
+      reasons.push(`${stage} model ${fullModel} is not routed through the OpenAI provider`);
+      continue;
+    }
+    const model = openai?.models?.[modelID];
+    if (!model) {
+      reasons.push(`${fullModel} is not available from the connected OpenAI provider`);
+      continue;
+    }
+    if (model.status && model.status !== 'active') {
+      reasons.push(`${fullModel} is not active in the connected OpenAI provider (status: ${model.status})`);
+      continue;
+    }
+    const issue = costMetadataIssue(model.cost);
+    if (issue) {
+      reasons.push(`${fullModel} does not have zero-valued subscription cost metadata (${issue})`);
+    }
+  }
+
+  if (reasons.length > 0) throw subscriptionPreflightError(reasons);
+  return true;
+}
+
+async function preflightChatGptSubscription(serverUrl, dir, stageModels) {
+  let res;
+  try {
+    res = await fetch(`${serverUrl}/provider?directory=${encodeURIComponent(dir)}`);
+  } catch (error) {
+    throw subscriptionPreflightError([`could not query OpenCode's provider registry: ${error.message}`]);
+  }
+  if (!res.ok) {
+    throw subscriptionPreflightError([`OpenCode's provider registry returned HTTP ${res.status}`]);
+  }
+  let registry;
+  try {
+    registry = await res.json();
+  } catch {
+    throw subscriptionPreflightError([`OpenCode's provider registry did not return valid JSON`]);
+  }
+  validateChatGptSubscriptionProvider(registry, stageModels);
+}
+
+async function resolveStageModels(config, { fetchPricingFn = fetchPricing } = {}) {
+  if (config.modelStrategy === 'fixed') {
+    return Object.fromEntries(
+      PIPELINE_STAGES.map((stage) => [stage, { model: config.stageModels[stage] }])
+    );
+  }
+
+  const pricingMap = await fetchPricingFn();
+  return Object.fromEntries(
+    PIPELINE_STAGES.map((stage) => {
+      const tier = config.stageTiers[stage];
+      return [stage, resolveTierModel(tier, config.tiers, pricingMap)];
+    })
+  );
+}
+
+function formatStageDone(stage, result, billingMode, verdict = null) {
+  const usage =
+    billingMode === 'chatgpt-subscription'
+      ? 'ChatGPT subscription allowance'
+      : `cost $${result.cost.toFixed(6)}`;
+  return `[${stage}] done (${usage})${verdict ? ` -> ${verdict}` : ''}`;
+}
+
+function formatPipelineSummary(stageLog, totalCost, reviewResult, billingMode) {
+  const lines = ['--- Pipeline summary ---'];
+  for (const stage of stageLog) {
+    const usage =
+      billingMode === 'chatgpt-subscription'
+        ? 'ChatGPT subscription allowance'
+        : `$${stage.cost.toFixed(6)}`;
+    lines.push(`  ${stage.stage.padEnd(16)} ${stage.model.padEnd(40)} ${usage}`);
+  }
+  if (billingMode === 'chatgpt-subscription') {
+    lines.push('  billing: ChatGPT subscription allowance');
+  } else {
+    lines.push(`  total cost: $${totalCost.toFixed(6)}`);
+  }
+  lines.push(`  result: ${reviewResult.verdict}${reviewResult.reason ? ` — ${reviewResult.reason}` : ''}`);
+  return lines.join('\n');
 }
 
 async function createSession(serverUrl, dir) {
@@ -96,17 +244,20 @@ async function listPendingPermissions(serverUrl, dir, sessionId) {
   }
 }
 
-async function sendPrompt(serverUrl, sessionId, { agent, model, prompt }) {
+async function sendPrompt(serverUrl, dir, sessionId, { agent, model, prompt }) {
   const { providerID, modelID } = splitModelId(model);
-  const res = await fetch(`${serverUrl}/session/${sessionId}/prompt_async`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      agent,
-      model: { providerID, modelID },
-      parts: [{ type: 'text', text: prompt }],
-    }),
-  });
+  const res = await fetch(
+    `${serverUrl}/session/${sessionId}/prompt_async?directory=${encodeURIComponent(dir)}`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        agent,
+        model: { providerID, modelID },
+        parts: [{ type: 'text', text: prompt }],
+      }),
+    }
+  );
   if (!res.ok) {
     const body = await res.text().catch(() => '');
     throw new Error(`prompt_async failed: HTTP ${res.status} ${body}`);
@@ -275,24 +426,43 @@ function startPermissionWatchdog(serverUrl, sessionId, stageLabel, dir) {
   };
 }
 
-async function getStageResult(serverUrl, sessionId) {
-  const res = await fetch(`${serverUrl}/session/${sessionId}/message`);
+async function getSessionMessages(serverUrl, dir, sessionId) {
+  const res = await fetch(
+    `${serverUrl}/session/${sessionId}/message?directory=${encodeURIComponent(dir)}`
+  );
   if (!res.ok) throw new Error(`fetching messages failed: HTTP ${res.status}`);
-  const messages = await res.json();
-  let text = '';
+  return res.json();
+}
+
+// A reused execute session contains several user turns. Only return the final
+// assistant response produced by this prompt, while charging all assistant
+// messages produced during the turn to this stage attempt.
+function getStageResult(messages, previousAssistantIds) {
+  const assistantMessages = messages.filter(
+    (message) => message.info?.role === 'assistant' && !previousAssistantIds.has(message.info.id)
+  );
   let cost = 0;
-  for (const m of messages) {
-    if (m.info.role !== 'assistant') continue;
-    cost += m.info.cost || 0;
-    for (const part of m.parts) {
-      if (part.type === 'text' && part.text) text += part.text;
-    }
+  for (const message of assistantMessages) cost += message.info.cost || 0;
+
+  const finalMessage = assistantMessages.findLast((message) =>
+    message.parts?.some((part) => part.type === 'text' && part.text)
+  );
+  const text = finalMessage?.parts
+    .filter((part) => part.type === 'text' && part.text)
+    .map((part) => part.text)
+    .join('\n') || '';
+  if (!text) {
+    throw new Error('stage became idle without a final assistant text response');
   }
   return { text, cost };
 }
 
-async function runStage({ serverUrl, agent, model, dir, prompt, stageLabel }) {
-  const sessionId = await createSession(serverUrl, dir);
+async function runStage({ serverUrl, agent, model, dir, prompt, stageLabel, sessionId: existingSessionId }) {
+  const sessionId = existingSessionId || await createSession(serverUrl, dir);
+  const before = existingSessionId ? await getSessionMessages(serverUrl, dir, sessionId) : [];
+  const previousAssistantIds = new Set(
+    before.filter((message) => message.info?.role === 'assistant').map((message) => message.info.id)
+  );
   const controller = new AbortController();
   // Subscribe to the event stream BEFORE sending the prompt: awaiting this
   // guarantees the server-side subscription exists before the stage can start
@@ -301,13 +471,14 @@ async function runStage({ serverUrl, agent, model, dir, prompt, stageLabel }) {
   const stopWatchdog = startPermissionWatchdog(serverUrl, sessionId, stageLabel, dir);
   try {
     await selectSessionInTui(serverUrl, sessionId);
-    await sendPrompt(serverUrl, sessionId, { agent, model, prompt });
+    await sendPrompt(serverUrl, dir, sessionId, { agent, model, prompt });
     await waitForSessionIdle(stream, sessionId, STAGE_TIMEOUT_MS);
   } finally {
     stopWatchdog();
     controller.abort();
   }
-  return getStageResult(serverUrl, sessionId);
+  const messages = await getSessionMessages(serverUrl, dir, sessionId);
+  return { ...getStageResult(messages, previousAssistantIds), sessionId };
 }
 
 async function runGit(dir, args) {
@@ -347,12 +518,42 @@ async function collectWorkingTreeState(dir) {
 function parseReviewResult(text) {
   const matches = [...text.matchAll(/REVIEW_RESULT:\s*(PASS|FAIL)(?::\s*(.*))?/g)];
   if (matches.length === 0) {
-    return { verdict: 'FAIL', reason: 'Review agent did not emit a REVIEW_RESULT sentinel line.' };
+    const reason = 'Review agent did not emit a REVIEW_RESULT sentinel line.';
+    return { verdict: 'FAIL', reason, feedback: reason };
   }
   const last = matches[matches.length - 1];
   const verdict = last[1];
   const reason = verdict === 'FAIL' ? (last[2] || '(no reason given)').trim() : null;
-  return { verdict, reason };
+  let feedback = null;
+  if (verdict === 'FAIL') {
+    const block = text.match(/(?:^|\n)REQUIRED_FIXES:\s*\n([\s\S]*?)(?=\n(?:NOTES:|REVIEW_RESULT:))/);
+    feedback = block?.[1]?.trim() || reason;
+  }
+  return { verdict, reason, feedback };
+}
+
+function parsePhaseResult(text, phase) {
+  const contracts = {
+    plan: { sentinel: 'PLAN_RESULT', success: 'READY' },
+    execute: { sentinel: 'EXECUTE_RESULT', success: 'COMPLETE' },
+  };
+  const contract = contracts[phase];
+  if (!contract) throw new Error(`unknown pipeline phase: ${phase}`);
+
+  const finalLine = text.trimEnd().split('\n').at(-1)?.trim() || '';
+  const match = finalLine.match(
+    new RegExp(`^${contract.sentinel}:\\s*(${contract.success}|BLOCKED)(?::\\s*(.*))?$`)
+  );
+  if (!match) {
+    return {
+      status: 'BLOCKED',
+      reason: `${phase} agent did not end with a valid ${contract.sentinel} status line.`,
+    };
+  }
+  if (match[1] === 'BLOCKED') {
+    return { status: 'BLOCKED', reason: (match[2] || '(no reason given)').trim() };
+  }
+  return { status: match[1], reason: null };
 }
 
 async function waitForServerReady(url, timeoutMs) {
@@ -392,12 +593,8 @@ async function startServer(port) {
   return { child, url };
 }
 
-async function main() {
-  const [, , task, targetDirArg] = process.argv;
-  if (!task) {
-    console.error('Usage: node run-pipeline.mjs "<task description>" [target-dir]');
-    process.exit(1);
-  }
+async function runPipeline({ task, targetDirArg, configPath } = {}) {
+  if (!task) throw new Error('A task description is required');
   const dir = path.resolve(targetDirArg || process.cwd());
 
   const port = process.env.PIPELINE_SERVER_PORT || DEFAULT_SERVER_PORT;
@@ -426,6 +623,15 @@ async function main() {
 
   let exitCode = 0;
   try {
+    const config = await loadConfig(configPath);
+    let resolved;
+    if (config.billingMode === 'chatgpt-subscription') {
+      resolved = await resolveStageModels(config);
+      console.log('Verifying ChatGPT subscription routing with OpenCode...');
+      await preflightChatGptSubscription(serverUrl, dir, config.stageModels);
+      console.log('ChatGPT subscription routing verified.\n');
+    }
+
     console.log(`\nAttach a TUI in another terminal:\n  opencode attach ${serverUrl}\n`);
     console.log(
       'Only the execute stage can prompt for bash approval (plan/review run read-only, deny bash+edit, and never prompt).'
@@ -444,17 +650,21 @@ async function main() {
     console.log(`\nPipeline target dir: ${dir}`);
     console.log(`Task: ${task}\n`);
 
-    console.log('Resolving models against live OpenRouter pricing...');
-    const config = await loadConfig();
-    const pricingMap = await fetchPricing();
-    const resolved = {};
-    for (const stage of ['plan', 'execute', 'review']) {
-      const tier = config.stageTiers[stage];
-      resolved[stage] = resolveTierModel(tier, config.tiers, pricingMap);
-      console.log(
-        `  ${stage} (tier=${tier}): ${resolved[stage].model} ` +
-          `(prompt $${resolved[stage].price.prompt}/tok, completion $${resolved[stage].price.completion}/tok)`
-      );
+    if (config.modelStrategy === 'tiered') {
+      console.log('Resolving models against live OpenRouter pricing...');
+      resolved = await resolveStageModels(config);
+      for (const stage of PIPELINE_STAGES) {
+        const tier = config.stageTiers[stage];
+        console.log(
+          `  ${stage} (tier=${tier}): ${resolved[stage].model} ` +
+            `(prompt $${resolved[stage].price.prompt}/tok, completion $${resolved[stage].price.completion}/tok)`
+        );
+      }
+    } else {
+      console.log('Using fixed ChatGPT subscription models:');
+      for (const stage of PIPELINE_STAGES) {
+        console.log(`  ${stage}: ${resolved[stage].model} (ChatGPT subscription allowance)`);
+      }
     }
     console.log();
 
@@ -472,10 +682,15 @@ async function main() {
     });
     totalCost += planResult.cost;
     stageLog.push({ stage: 'plan', model: resolved.plan.model, cost: planResult.cost });
-    console.log(`[plan] done (cost $${planResult.cost.toFixed(6)})\n`);
+    console.log(`${formatStageDone('plan', planResult, config.billingMode)}\n`);
+    const planStatus = parsePhaseResult(planResult.text, 'plan');
+    if (planStatus.status !== 'READY') {
+      throw new Error(`[plan] blocked: ${planStatus.reason}`);
+    }
 
     let executePrompt = `Task: ${task}\n\nPlan:\n${planResult.text}`;
     let executeResult;
+    let executeSessionId;
     let reviewResult;
     let attempt = 0;
 
@@ -488,10 +703,16 @@ async function main() {
         dir,
         prompt: executePrompt,
         stageLabel: `execute${attempt > 0 ? `-retry${attempt}` : ''}`,
+        sessionId: executeSessionId,
       });
+      executeSessionId = executeResult.sessionId;
       totalCost += executeResult.cost;
       stageLog.push({ stage: `execute${attempt > 0 ? `-retry${attempt}` : ''}`, model: resolved.execute.model, cost: executeResult.cost });
-      console.log(`[execute] done (cost $${executeResult.cost.toFixed(6)})\n`);
+      console.log(`${formatStageDone('execute', executeResult, config.billingMode)}\n`);
+      const executeStatus = parsePhaseResult(executeResult.text, 'execute');
+      if (executeStatus.status !== 'COMPLETE') {
+        throw new Error(`[execute] blocked: ${executeStatus.reason}`);
+      }
 
       console.log(`[review] running ${resolved.review.model}${attempt > 0 ? ` (retry ${attempt})` : ''}...`);
       const treeState = await collectWorkingTreeState(dir);
@@ -509,7 +730,7 @@ async function main() {
       totalCost += rawReview.cost;
       stageLog.push({ stage: `review${attempt > 0 ? `-retry${attempt}` : ''}`, model: resolved.review.model, cost: rawReview.cost });
       reviewResult = parseReviewResult(rawReview.text);
-      console.log(`[review] done (cost $${rawReview.cost.toFixed(6)}) -> ${reviewResult.verdict}\n`);
+      console.log(`${formatStageDone('review', rawReview, config.billingMode, reviewResult.verdict)}\n`);
       // The verdict used to be all the operator saw; print the reviewer's full
       // findings so notes that don't rise to FAIL still reach a human.
       console.log(`--- review findings ---\n${rawReview.text.trim()}\n-----------------------\n`);
@@ -519,17 +740,12 @@ async function main() {
 
       attempt += 1;
       executePrompt =
-        `Task: ${task}\n\nPlan:\n${planResult.text}\n\n` +
-        `Your previous attempt was rejected by review for this reason:\n${reviewResult.reason}\n\n` +
-        `Fix that specific problem without regressing other parts of the plan you already completed.`;
+        `Review rejected the previous attempt. Address every item below, then re-run the relevant ` +
+        `verification and end with the required EXECUTE_RESULT status line.\n\n` +
+        `REQUIRED_FIXES:\n${reviewResult.feedback}`;
     }
 
-    console.log('--- Pipeline summary ---');
-    for (const s of stageLog) {
-      console.log(`  ${s.stage.padEnd(16)} ${s.model.padEnd(40)} $${s.cost.toFixed(6)}`);
-    }
-    console.log(`  total cost: $${totalCost.toFixed(6)}`);
-    console.log(`  result: ${reviewResult.verdict}${reviewResult.reason ? ` — ${reviewResult.reason}` : ''}`);
+    console.log(formatPipelineSummary(stageLog, totalCost, reviewResult, config.billingMode));
 
     exitCode = reviewResult.verdict === 'PASS' ? 0 : 1;
   } finally {
@@ -537,7 +753,16 @@ async function main() {
     cleanup();
   }
 
-  process.exit(exitCode);
+  return exitCode;
+}
+
+async function runPipelineFromCli({ configPath, usage = 'node run-pipeline.mjs' } = {}) {
+  const [, , task, targetDirArg] = process.argv;
+  if (!task) {
+    console.error(`Usage: ${usage} "<task description>" [target-dir]`);
+    return 1;
+  }
+  return runPipeline({ task, targetDirArg, configPath });
 }
 
 // True when this file is the entry point, including via a bin symlink (npm
@@ -545,12 +770,30 @@ async function main() {
 // (pathToFileURL percent-encodes the way import.meta.url does).
 const isMain = process.argv[1] && import.meta.url === pathToFileURL(realpathSync(process.argv[1])).href;
 if (isMain) {
-  main().catch((err) => {
-    console.error(`Pipeline failed: ${err.message}`);
-    process.exit(1);
-  });
+  runPipelineFromCli()
+    .then((exitCode) => process.exit(exitCode))
+    .catch((err) => {
+      console.error(`Pipeline failed: ${err.message}`);
+      process.exit(1);
+    });
 }
 
 // Exported for tests (and potential reuse); running this file directly still
 // executes the pipeline via the isMain guard above.
-export { startPermissionWatchdog, listPendingPermissions, permissionReplyCommand, parseReviewResult, formatWorkingTreeState, collectWorkingTreeState };
+export {
+  startPermissionWatchdog,
+  listPendingPermissions,
+  permissionReplyCommand,
+  parseReviewResult,
+  parsePhaseResult,
+  getStageResult,
+  formatWorkingTreeState,
+  collectWorkingTreeState,
+  validateChatGptSubscriptionProvider,
+  preflightChatGptSubscription,
+  resolveStageModels,
+  formatStageDone,
+  formatPipelineSummary,
+  runPipeline,
+  runPipelineFromCli,
+};

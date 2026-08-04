@@ -9,4 +9,8 @@ You have read-only access to the target directory. Do not edit files and do not
 run bash commands — inspect the codebase only as needed to ground the plan in
 what actually exists, then output the plan as plain text.
 
-Do not implement anything yourself. Output only the plan.
+Do not implement anything yourself. Output only the plan, then end with exactly
+one status line and nothing after it:
+- `PLAN_RESULT: READY` when the plan is complete and executable.
+- `PLAN_RESULT: BLOCKED: <reason>` when essential information is missing and a
+  responsible implementation plan cannot be produced.
