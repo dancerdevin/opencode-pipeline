@@ -24,6 +24,8 @@ dependency clearly earns its place.
   HTTP, never the CLI.
 - `run-gpt-pipeline.mjs` — GPT subscription entry point, published as
   `opencode-gpt-pipeline`.
+- `issue-launcher.mjs` — `--issue` intake, server preflight, and deterministic
+  feature-branch preparation before delegating to the shared orchestrator.
 - `config.mjs` — loader/validator for tiered and fixed-model configurations.
 - `resolve-model.mjs` — cheapest-per-tier resolver (`node resolve-model.mjs <tier>`
   prints what would be picked right now).
@@ -78,6 +80,20 @@ After editing `prompts/`: re-run `node setup.mjs` **and restart any running
   exist, and their cost metadata must be zero. Nonzero costs indicate API-key
   routing and must be rejected. Never add an API-key, OpenRouter, or model
   fallback to the GPT command.
+- **Loaded-agent preflight is contract-aware.** `/agent` must expose all three
+  pipeline agents and their current plan/execute/review sentinel text before a
+  stage starts. A stale server fails with setup/restart guidance instead of
+  spending a model turn on yesterday's prompts.
+- **Issue mode is the one branch exception.** The core pipeline never mutates
+  git. Either command's `--issue` mode may create one deterministic feature
+  branch, but only from a clean default branch synchronized with its fetched
+  `origin/<default>`. It never commits, pushes, opens PRs, reuses an existing
+  issue branch implicitly, or changes an explicitly selected feature branch.
+- **Issue model resolution happens before branching.** OpenRouter issue runs
+  resolve live pricing exactly once and pass that frozen stage-model snapshot
+  into the orchestrator; pricing failure must leave the current branch
+  untouched. GPT issue runs resolve fixed models and additionally perform the
+  subscription preflight. Billing output remains mode-specific.
 - **Billing output follows the mode.** OpenRouter runs keep per-stage and total
   dollar receipts. GPT runs name each stage/model and say `ChatGPT subscription
   allowance`; do not print dollar costs for GPT runs.
@@ -101,12 +117,17 @@ After editing `prompts/`: re-run `node setup.mjs` **and restart any running
    inline `agent` block in the server's `opencode.json(c)`; either way the
    server must have been (re)started after they were defined.
 4. Target repo on a **clean feature branch**. The execute agent edits the
-   working tree in place; the pipeline never branches, commits, pushes, or
-   opens PRs — that is the supervisor's job before and after the run.
+   working tree in place; the core pipeline never branches, commits, pushes, or
+   opens PRs. Issue mode may prepare its documented branch before delegation.
 5. For GPT mode, authenticate with `opencode auth login` → OpenAI → ChatGPT
    Plus/Pro, run `node setup.mjs`, then restart the server. The GPT command
    intentionally rejects OpenAI API-key authentication. Subscription use still
    counts against the limits of the user's ChatGPT plan.
+
+For issue mode, the launcher performs these checks itself and also requires an
+open issue available through authenticated `gh`. It includes the issue body,
+labels, and all comments verbatim in the task packet. A number resolves against
+the target repository; a URL must name that same repository.
 
 ### Launch & watch
 
@@ -117,6 +138,22 @@ PIPELINE_SERVER_URL=http://127.0.0.1:<port> \
 
 Use `node run-gpt-pipeline.mjs` (or `opencode-gpt-pipeline` after package
 installation) for the fixed ChatGPT subscription route.
+
+For the smallest supervising-agent workload, use the foreground issue mode:
+
+```bash
+PIPELINE_SERVER_URL=http://127.0.0.1:<port> \
+  opencode-pipeline --issue <number-or-url> <target-dir>
+# Or use opencode-gpt-pipeline for the subscription route:
+PIPELINE_SERVER_URL=http://127.0.0.1:<port> \
+  opencode-gpt-pipeline --issue <number-or-url> <target-dir>
+```
+
+From the default branch it fetches and verifies `origin/<default>`, then creates
+`issue-<number>-<sanitized-title>`. From a clean non-default branch it leaves
+the branch untouched. An existing generated branch name, dirty tree, detached
+HEAD, missing origin, closed/mismatched issue, stale agent prompt, or divergent
+default branch is a terminal preflight failure for the supervisor to report.
 
 With `PIPELINE_SERVER_URL` set, the script attaches to the existing server and
 does not spawn/tear one down (and skips the "press Enter" pause). Run it in the

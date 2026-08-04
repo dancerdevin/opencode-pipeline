@@ -10,6 +10,9 @@ with a human (you) approving shell commands live. It has two public commands:
   models: Terra for plan, Luna for execute, and Sol for review. It never queries
   OpenRouter pricing and never falls back to an API key or another model.
 
+Both commands support `--issue` to fetch an open GitHub issue and prepare a
+feature branch before entering their normal model route.
+
 Both commands use the same OpenCode sessions, prompts, permission handling,
 diff-aware review, and retry loop. The execute stage's `bash` calls surface in
 an attached OpenCode TUI for you to approve or reject as they happen.
@@ -58,6 +61,7 @@ it yourself.
 opencode-pipeline/
 ├── run-pipeline.mjs      # shared orchestrator + OpenRouter entry point
 ├── run-gpt-pipeline.mjs  # fixed-model ChatGPT subscription entry point
+├── issue-launcher.mjs    # GitHub issue intake and safe branch preparation
 ├── config.mjs            # tiered/fixed config loading and validation
 ├── resolve-model.mjs     # cheapest-per-tier resolver against OpenRouter live pricing
 ├── setup.mjs             # installs the three pipeline agents into your opencode config
@@ -87,6 +91,8 @@ interruption.
   decide whether GPT subscription mode can run.
 - OpenRouter credentials for `opencode-pipeline`, or ChatGPT Plus/Pro OAuth for
   `opencode-gpt-pipeline` (setup below).
+- For `--issue`, GitHub CLI installed and authenticated (`gh auth status`) with
+  access to the target repository and issue.
 - Node 20+ (`node --version`). There are no npm dependencies — the pipeline uses
   only the Node standard library.
 
@@ -113,7 +119,9 @@ If installed as a package, the two binaries are:
 
 ```bash
 opencode-pipeline "<task>" [target-dir]
+opencode-pipeline --issue <number-or-url> [target-dir]
 opencode-gpt-pipeline "<task>" [target-dir]
+opencode-gpt-pipeline --issue <number-or-url> [target-dir]
 ```
 
 The source-checkout equivalents are `node run-pipeline.mjs` and `node
@@ -156,6 +164,49 @@ If any check fails, the command exits with the OAuth steps above. OpenAI API-key
 authentication is intentionally rejected because it carries nonzero API
 pricing; there is no fallback to an API key, OpenRouter, or another model.
 Subscription usage remains subject to your ChatGPT plan's allowance and limits.
+
+### Run an open GitHub issue
+
+Issue mode reduces supervision to one foreground command. It requires the
+OpenCode server and approval TUI to be running already; it uses
+`PIPELINE_SERVER_URL`, or `http://127.0.0.1:4747` by default:
+
+```bash
+# In the target repository (or pass it as the final argument):
+# Price-aware OpenRouter route:
+opencode-pipeline --issue 123
+
+# Fixed ChatGPT subscription route:
+opencode-gpt-pipeline --issue 123
+opencode-gpt-pipeline --issue https://github.com/owner/repo/issues/123 /path/to/repo
+```
+
+The launcher fails before model work if `gh` is unavailable, the issue is
+closed or belongs to another repository, the tree is dirty, the server is
+unreachable, the selected model route cannot preflight, or the running server
+has missing/stale pipeline prompts. It sends the issue title, body, labels, and
+all comments to the plan stage without model-generated summarization.
+
+The OpenRouter command resolves its three models against live pricing before
+creating a branch, freezes that model snapshot for the run, and retains the
+normal dollar receipt. `PIPELINE_CONFIG` overrides continue to apply. The GPT
+command performs its subscription-routing check instead and retains its
+allowance-only output.
+
+On a clean non-default branch, the launcher uses that branch unchanged. On the
+default branch, it fetches `origin/<default>`, requires local and remote tips to
+match, and creates `issue-<number>-<sanitized-title>`. It refuses to reuse an
+existing branch with that name; inspect and select that branch explicitly if
+you intend to resume it. The launcher streams the normal pipeline output and
+returns its PASS/FAIL exit code. It never commits, pushes, opens a PR, or grows
+the diff after review.
+
+A lightweight supervising agent can be told:
+
+> Run `opencode-pipeline --issue 123 /path/to/repo` (or the GPT command) in the foreground with
+> enough time for the pipeline to finish. Monitor and report its final result;
+> do not implement, commit, or push anything yourself. I will handle approval
+> asks in the separately attached TUI.
 
 ## Terminal setup
 
@@ -333,7 +384,7 @@ their sentinels directly.
 
 | Variable                          | Default         | Purpose |
 |-----------------------------------|-----------------|---------|
-| `PIPELINE_SERVER_URL`             | *(unset)*       | Attach to an already-running server at this URL; skip spawn/teardown. |
+| `PIPELINE_SERVER_URL`             | *(unset)*       | Attach to an already-running server at this URL; skip spawn/teardown. Issue mode defaults it to localhost using `PIPELINE_SERVER_PORT`. |
 | `PIPELINE_SERVER_PORT`            | `4747`          | Port for the server the script spawns (ignored if `PIPELINE_SERVER_URL` is set). |
 | `PIPELINE_CONFIG`                 | `pipeline.config.json` next to the scripts | Path to the pipeline config file. |
 | `PIPELINE_STAGE_TIMEOUT_MS`       | `1800000` (30m) | How long a single stage may run before timing out. Generous because you may take time to approve. |

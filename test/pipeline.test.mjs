@@ -14,11 +14,26 @@ import {
   formatWorkingTreeState,
   collectWorkingTreeState,
   validateChatGptSubscriptionProvider,
+  validatePipelineAgents,
+  preflightExistingPipelineServer,
   resolveStageModels,
+  resolveStageModelsIfNeeded,
   formatStageDone,
   formatPipelineSummary,
+  runPipelineFromCli,
 } from '../run-pipeline.mjs';
-import { GPT_CONFIG_PATH, loadConfig } from '../config.mjs';
+import {
+  formatIssueTask,
+  inspectIssueRun,
+  isIssueReference,
+  issueBranchName,
+  parsePipelineCliArgs,
+  prepareIssueBranch,
+  runIssuePipeline,
+  validateIssueForRepository,
+} from '../issue-launcher.mjs';
+import { runGptPipelineFromCli } from '../run-gpt-pipeline.mjs';
+import { DEFAULT_CONFIG_PATH, GPT_CONFIG_PATH, loadConfig } from '../config.mjs';
 import { resolveTierModel } from '../resolve-model.mjs';
 
 const execFileAsync = promisify(execFile);
@@ -47,6 +62,37 @@ function subscriptionRegistry({ connected = ['openai'], missing = [], costs = {}
     all: [{ id: 'openai', models }],
   };
 }
+
+function response({ ok = true, status = 200, json }) {
+  return { ok, status, json: async () => json };
+}
+
+function commandStub(expected) {
+  const calls = [];
+  const execFn = async (command, args, options) => {
+    calls.push({ command, args, cwd: options.cwd });
+    const next = expected.shift();
+    assert.ok(next, `unexpected command: ${command} ${args.join(' ')}`);
+    assert.equal(command, next.command);
+    assert.deepEqual(args, next.args);
+    if (next.error) {
+      const error = new Error(next.error);
+      error.stderr = next.error;
+      throw error;
+    }
+    return { stdout: next.stdout || '', stderr: '' };
+  };
+  return { execFn, calls };
+}
+
+const PIPELINE_AGENTS = [
+  { name: 'pipeline-plan', prompt: 'PLAN_RESULT: READY\nPLAN_RESULT: BLOCKED: <reason>' },
+  { name: 'pipeline-execute', prompt: 'EXECUTE_RESULT: COMPLETE\nEXECUTE_RESULT: BLOCKED: <reason>' },
+  {
+    name: 'pipeline-review',
+    prompt: 'REQUIRED_FIXES:\nREVIEW_RESULT: PASS\nREVIEW_RESULT: FAIL: <short, specific, actionable reason>',
+  },
+];
 
 test('parseReviewResult: clean PASS', () => {
   const { verdict, reason } = parseReviewResult('Looks good.\nREVIEW_RESULT: PASS');
@@ -210,6 +256,434 @@ test('permissionReplyCommand: includes directory-scoped URL, request id, and rep
   assert.match(cmd, /"reply":"once"/);
 });
 
+test('issue CLI: parses issue numbers, URLs, legacy tasks, and help', () => {
+  assert.deepEqual(parsePipelineCliArgs(['--issue', '123', '/repo']), {
+    mode: 'issue',
+    issueRef: '123',
+    targetDirArg: '/repo',
+  });
+  assert.equal(parsePipelineCliArgs(['--issue', 'https://github.com/acme/app/issues/9']).mode, 'issue');
+  assert.deepEqual(parsePipelineCliArgs(['fix the bug', '/repo']), {
+    mode: 'task',
+    task: 'fix the bug',
+    targetDirArg: '/repo',
+  });
+  assert.deepEqual(parsePipelineCliArgs(['--help']), { mode: 'help' });
+  assert.equal(parsePipelineCliArgs(['--issue', 'nope']).mode, 'error');
+  assert.equal(parsePipelineCliArgs([]).mode, 'error');
+  assert.equal(isIssueReference('0'), false);
+  assert.equal(isIssueReference('ftp://github.com/acme/app/issues/1'), false);
+});
+
+test('GPT CLI: issue mode defaults to the existing localhost server and preserves legacy mode', async () => {
+  let issueInput;
+  const issueExit = await runGptPipelineFromCli(['--issue', '42', '/repo'], {
+    env: {},
+    runIssuePipelineFn: async (input) => {
+      issueInput = input;
+      return 7;
+    },
+  });
+  assert.equal(issueExit, 7);
+  assert.equal(issueInput.serverUrl, 'http://127.0.0.1:4747');
+  assert.equal(issueInput.configPath, GPT_CONFIG_PATH);
+
+  let taskInput;
+  await runGptPipelineFromCli(['do it', '/repo'], {
+    runPipelineFn: async (input) => {
+      taskInput = input;
+      return 0;
+    },
+  });
+  assert.equal(taskInput.task, 'do it');
+  assert.equal(taskInput.configPath, GPT_CONFIG_PATH);
+});
+
+test('standard CLI: issue mode honors PIPELINE_CONFIG and defaults to OpenRouter config', async () => {
+  let customInput;
+  await runPipelineFromCli({
+    args: ['--issue', '42', '/repo'],
+    env: { PIPELINE_CONFIG: '/tmp/custom.json', PIPELINE_SERVER_PORT: '5555' },
+    runIssuePipelineFn: async (input) => {
+      customInput = input;
+      return 0;
+    },
+  });
+  assert.equal(customInput.configPath, '/tmp/custom.json');
+  assert.equal(customInput.serverUrl, 'http://127.0.0.1:5555');
+
+  let defaultInput;
+  await runPipelineFromCli({
+    args: ['--issue', '42', '/repo'],
+    env: {},
+    runIssuePipelineFn: async (input) => {
+      defaultInput = input;
+      return 0;
+    },
+  });
+  assert.equal(defaultInput.configPath, DEFAULT_CONFIG_PATH);
+});
+
+test('issueBranchName: produces deterministic capped ASCII branch names', () => {
+  assert.equal(issueBranchName(12, 'Fix Café / Empty State!'), 'issue-12-fix-cafe-empty-state');
+  assert.equal(issueBranchName(12, '✨✨'), 'issue-12');
+  assert.ok(issueBranchName(999, 'x'.repeat(200)).length <= 80);
+});
+
+test('formatIssueTask: preserves body, labels, and chronological comments', () => {
+  const task = formatIssueTask(
+    {
+      number: 4,
+      title: 'Improve launch',
+      url: 'https://github.com/acme/app/issues/4',
+      body: 'Acceptance criteria here.',
+      labels: [{ name: 'feature' }, { name: 'client' }],
+      comments: [
+        { author: { login: 'b' }, createdAt: '2026-01-02T00:00:00Z', body: 'Second' },
+        { author: { login: 'a' }, createdAt: '2026-01-01T00:00:00Z', body: 'First' },
+      ],
+    },
+    { nameWithOwner: 'acme/app' }
+  );
+  assert.match(task, /Labels: feature, client/);
+  assert.match(task, /Issue body:\nAcceptance criteria here\./);
+  assert.ok(task.indexOf('First') < task.indexOf('Second'));
+});
+
+test('validateIssueForRepository: rejects closed and wrong-repository issues', () => {
+  const repository = { nameWithOwner: 'acme/app' };
+  assert.throws(
+    () => validateIssueForRepository({ number: 1, title: 'x', url: 'https://github.com/acme/app/issues/1', state: 'CLOSED' }, repository),
+    /only runs open issues/
+  );
+  assert.throws(
+    () => validateIssueForRepository({ number: 1, title: 'x', url: 'https://github.com/other/app/issues/1', state: 'OPEN' }, repository),
+    /belongs to other\/app/
+  );
+});
+
+test('inspectIssueRun: resolves a clean repository and complete issue packet', async () => {
+  const repository = {
+    nameWithOwner: 'acme/app',
+    url: 'https://github.com/acme/app',
+    defaultBranchRef: { name: 'main' },
+  };
+  const issue = {
+    number: 8,
+    title: 'Add retries',
+    body: 'Do the thing.',
+    url: 'https://github.com/acme/app/issues/8',
+    state: 'OPEN',
+    labels: [],
+    comments: [],
+  };
+  const { execFn, calls } = commandStub([
+    { command: 'git', args: ['rev-parse', '--show-toplevel'], stdout: '/repo\n' },
+    { command: 'git', args: ['status', '--porcelain'] },
+    { command: 'git', args: ['branch', '--show-current'], stdout: 'main\n' },
+    { command: 'git', args: ['remote', 'get-url', 'origin'], stdout: 'git@github.com:acme/app.git\n' },
+    { command: 'gh', args: ['repo', 'view', '--json', 'nameWithOwner,url,defaultBranchRef'], stdout: JSON.stringify(repository) },
+    { command: 'gh', args: ['issue', 'view', '8', '--repo', 'acme/app', '--json', 'number,title,body,url,state,labels,comments'], stdout: JSON.stringify(issue) },
+  ]);
+  const context = await inspectIssueRun('8', '/repo/subdir', { execFn });
+  assert.equal(context.root, '/repo');
+  assert.equal(context.issueBranch, 'issue-8-add-retries');
+  assert.match(context.task, /Do the thing/);
+  assert.equal(calls[1].cwd, '/repo');
+});
+
+test('inspectIssueRun: rejects a dirty worktree before GitHub calls', async () => {
+  const { execFn, calls } = commandStub([
+    { command: 'git', args: ['rev-parse', '--show-toplevel'], stdout: '/repo\n' },
+    { command: 'git', args: ['status', '--porcelain'], stdout: ' M app.js\n' },
+  ]);
+  await assert.rejects(() => inspectIssueRun('8', '/repo', { execFn }), /clean working tree/);
+  assert.equal(calls.length, 2);
+});
+
+test('inspectIssueRun: rejects detached HEAD, missing origin, and malformed GitHub JSON', async () => {
+  const detached = commandStub([
+    { command: 'git', args: ['rev-parse', '--show-toplevel'], stdout: '/repo\n' },
+    { command: 'git', args: ['status', '--porcelain'] },
+    { command: 'git', args: ['branch', '--show-current'] },
+  ]);
+  await assert.rejects(() => inspectIssueRun('8', '/repo', detached), /detached HEAD/);
+
+  const missingOrigin = commandStub([
+    { command: 'git', args: ['rev-parse', '--show-toplevel'], stdout: '/repo\n' },
+    { command: 'git', args: ['status', '--porcelain'] },
+    { command: 'git', args: ['branch', '--show-current'], stdout: 'main\n' },
+    { command: 'git', args: ['remote', 'get-url', 'origin'], error: 'No such remote' },
+  ]);
+  await assert.rejects(() => inspectIssueRun('8', '/repo', missingOrigin), /checking origin remote failed/);
+
+  const malformed = commandStub([
+    { command: 'git', args: ['rev-parse', '--show-toplevel'], stdout: '/repo\n' },
+    { command: 'git', args: ['status', '--porcelain'] },
+    { command: 'git', args: ['branch', '--show-current'], stdout: 'main\n' },
+    { command: 'git', args: ['remote', 'get-url', 'origin'], stdout: 'origin\n' },
+    { command: 'gh', args: ['repo', 'view', '--json', 'nameWithOwner,url,defaultBranchRef'], stdout: '{bad' },
+  ]);
+  await assert.rejects(() => inspectIssueRun('8', '/repo', malformed), /malformed JSON/);
+});
+
+test('prepareIssueBranch: fetches, verifies, and creates from synchronized default', async () => {
+  const context = {
+    root: '/repo',
+    branch: 'main',
+    issueBranch: 'issue-8-add-retries',
+    repository: { defaultBranchRef: { name: 'main' } },
+  };
+  const { execFn } = commandStub([
+    { command: 'git', args: ['fetch', 'origin', 'main'] },
+    { command: 'git', args: ['rev-parse', 'refs/heads/main'], stdout: 'abc\n' },
+    { command: 'git', args: ['rev-parse', 'refs/remotes/origin/main'], stdout: 'abc\n' },
+    { command: 'git', args: ['branch', '--list', 'issue-8-add-retries'] },
+    { command: 'git', args: ['switch', '-c', 'issue-8-add-retries'] },
+  ]);
+  assert.deepEqual(await prepareIssueBranch(context, { execFn }), {
+    branch: 'issue-8-add-retries',
+    created: true,
+  });
+});
+
+test('prepareIssueBranch: preserves prepared feature branches and rejects unsafe defaults', async () => {
+  const feature = {
+    root: '/repo',
+    branch: 'custom-feature',
+    issueBranch: 'issue-8-add-retries',
+    repository: { defaultBranchRef: { name: 'main' } },
+  };
+  const noCommands = commandStub([]);
+  assert.deepEqual(await prepareIssueBranch(feature, noCommands), {
+    branch: 'custom-feature',
+    created: false,
+  });
+
+  const diverged = { ...feature, branch: 'main' };
+  const divergedCommands = commandStub([
+    { command: 'git', args: ['fetch', 'origin', 'main'] },
+    { command: 'git', args: ['rev-parse', 'refs/heads/main'], stdout: 'local\n' },
+    { command: 'git', args: ['rev-parse', 'refs/remotes/origin/main'], stdout: 'remote\n' },
+  ]);
+  await assert.rejects(() => prepareIssueBranch(diverged, divergedCommands), /does not match/);
+
+  const existingCommands = commandStub([
+    { command: 'git', args: ['fetch', 'origin', 'main'] },
+    { command: 'git', args: ['rev-parse', 'refs/heads/main'], stdout: 'same\n' },
+    { command: 'git', args: ['rev-parse', 'refs/remotes/origin/main'], stdout: 'same\n' },
+    { command: 'git', args: ['branch', '--list', 'issue-8-add-retries'], stdout: '  issue-8-add-retries\n' },
+  ]);
+  await assert.rejects(() => prepareIssueBranch(diverged, existingCommands), /already exists/);
+});
+
+test('pipeline agent preflight: validates names and current prompt contracts', async () => {
+  assert.equal(validatePipelineAgents(PIPELINE_AGENTS), true);
+  assert.throws(
+    () => validatePipelineAgents(PIPELINE_AGENTS.map((agent) => agent.name === 'pipeline-plan' ? { ...agent, prompt: 'old' } : agent)),
+    /pipeline-plan is stale/
+  );
+  assert.throws(() => validatePipelineAgents([]), /pipeline-plan is not loaded/);
+
+  const urls = [];
+  await preflightExistingPipelineServer('http://127.0.0.1:4747', '/repo path', {
+    fetchFn: async (url) => {
+      urls.push(url);
+      return urls.length === 1 ? response({}) : response({ json: PIPELINE_AGENTS });
+    },
+  });
+  assert.match(urls[0], /global\/health$/);
+  assert.match(urls[1], /directory=%2Frepo%20path/);
+
+  await assert.rejects(
+    () => preflightExistingPipelineServer('http://127.0.0.1:4747', '/repo', {
+      fetchFn: async () => response({ ok: false, status: 503 }),
+    }),
+    /global\/health returned HTTP 503/
+  );
+});
+
+test('runIssuePipeline: server failure occurs before fetch or branch creation', async () => {
+  const repository = {
+    nameWithOwner: 'acme/app',
+    url: 'https://github.com/acme/app',
+    defaultBranchRef: { name: 'main' },
+  };
+  const issue = {
+    number: 8,
+    title: 'Add retries',
+    body: '',
+    url: 'https://github.com/acme/app/issues/8',
+    state: 'OPEN',
+    labels: [],
+    comments: [],
+  };
+  const commands = commandStub([
+    { command: 'git', args: ['rev-parse', '--show-toplevel'], stdout: '/repo\n' },
+    { command: 'git', args: ['status', '--porcelain'] },
+    { command: 'git', args: ['branch', '--show-current'], stdout: 'main\n' },
+    { command: 'git', args: ['remote', 'get-url', 'origin'], stdout: 'origin\n' },
+    { command: 'gh', args: ['repo', 'view', '--json', 'nameWithOwner,url,defaultBranchRef'], stdout: JSON.stringify(repository) },
+    { command: 'gh', args: ['issue', 'view', '8', '--repo', 'acme/app', '--json', 'number,title,body,url,state,labels,comments'], stdout: JSON.stringify(issue) },
+  ]);
+  await assert.rejects(
+    () => runIssuePipeline(
+      { issueRef: '8', targetDirArg: '/repo', serverUrl: 'http://server' },
+      {
+        execFn: commands.execFn,
+        loadConfigFn: async () => ({ billingMode: 'chatgpt-subscription', stageModels: GPT_STAGE_MODELS }),
+        preflightServerFn: async () => { throw new Error('server unavailable'); },
+      }
+    ),
+    /server unavailable/
+  );
+  assert.equal(commands.calls.length, 6);
+});
+
+test('runIssuePipeline: completes all preflights before branch mutation and forwards task', async () => {
+  const repository = {
+    nameWithOwner: 'acme/app',
+    url: 'https://github.com/acme/app',
+    defaultBranchRef: { name: 'main' },
+  };
+  const issue = {
+    number: 8,
+    title: 'Add retries',
+    body: 'Do it.',
+    url: 'https://github.com/acme/app/issues/8',
+    state: 'OPEN',
+    labels: [],
+    comments: [],
+  };
+  const commands = commandStub([
+    { command: 'git', args: ['rev-parse', '--show-toplevel'], stdout: '/repo\n' },
+    { command: 'git', args: ['status', '--porcelain'] },
+    { command: 'git', args: ['branch', '--show-current'], stdout: 'main\n' },
+    { command: 'git', args: ['remote', 'get-url', 'origin'], stdout: 'origin\n' },
+    { command: 'gh', args: ['repo', 'view', '--json', 'nameWithOwner,url,defaultBranchRef'], stdout: JSON.stringify(repository) },
+    { command: 'gh', args: ['issue', 'view', '8', '--repo', 'acme/app', '--json', 'number,title,body,url,state,labels,comments'], stdout: JSON.stringify(issue) },
+    { command: 'git', args: ['fetch', 'origin', 'main'] },
+    { command: 'git', args: ['rev-parse', 'refs/heads/main'], stdout: 'same\n' },
+    { command: 'git', args: ['rev-parse', 'refs/remotes/origin/main'], stdout: 'same\n' },
+    { command: 'git', args: ['branch', '--list', 'issue-8-add-retries'] },
+    { command: 'git', args: ['switch', '-c', 'issue-8-add-retries'] },
+  ]);
+  const events = [];
+  let pipelineInput;
+  const exitCode = await runIssuePipeline(
+    { issueRef: '8', targetDirArg: '/repo', serverUrl: 'http://server', configPath: GPT_CONFIG_PATH },
+    {
+      execFn: commands.execFn,
+      loadConfigFn: async () => ({ billingMode: 'chatgpt-subscription', stageModels: GPT_STAGE_MODELS }),
+      preflightServerFn: async () => events.push('server'),
+      preflightSubscriptionFn: async () => events.push('subscription'),
+      resolveStageModelsFn: async () => {
+        events.push('resolve');
+        return { plan: { model: 'p' }, execute: { model: 'e' }, review: { model: 'r' } };
+      },
+      runPipelineFn: async (input) => {
+        events.push('pipeline');
+        pipelineInput = input;
+        return 0;
+      },
+    }
+  );
+  assert.equal(exitCode, 0);
+  assert.deepEqual(events, ['server', 'subscription', 'resolve', 'pipeline']);
+  assert.match(pipelineInput.task, /GitHub issue #8/);
+  assert.equal(pipelineInput.preflightComplete, true);
+  assert.equal(pipelineInput.configPath, GPT_CONFIG_PATH);
+  assert.equal(pipelineInput.resolvedStageModelsArg.plan.model, 'p');
+});
+
+test('runIssuePipeline: OpenRouter resolves pricing once, skips GPT preflight, and forwards snapshot', async () => {
+  const repository = {
+    nameWithOwner: 'acme/app',
+    url: 'https://github.com/acme/app',
+    defaultBranchRef: { name: 'main' },
+  };
+  const issue = {
+    number: 8,
+    title: 'Add retries',
+    body: 'Do it.',
+    url: 'https://github.com/acme/app/issues/8',
+    state: 'OPEN',
+    labels: [],
+    comments: [],
+  };
+  const commands = commandStub([
+    { command: 'git', args: ['rev-parse', '--show-toplevel'], stdout: '/repo\n' },
+    { command: 'git', args: ['status', '--porcelain'] },
+    { command: 'git', args: ['branch', '--show-current'], stdout: 'feature/already-prepared\n' },
+    { command: 'git', args: ['remote', 'get-url', 'origin'], stdout: 'origin\n' },
+    { command: 'gh', args: ['repo', 'view', '--json', 'nameWithOwner,url,defaultBranchRef'], stdout: JSON.stringify(repository) },
+    { command: 'gh', args: ['issue', 'view', '8', '--repo', 'acme/app', '--json', 'number,title,body,url,state,labels,comments'], stdout: JSON.stringify(issue) },
+  ]);
+  const snapshot = { plan: { model: 'a' }, execute: { model: 'b' }, review: { model: 'c' } };
+  let resolveCalls = 0;
+  let subscriptionCalls = 0;
+  let pipelineInput;
+  await runIssuePipeline(
+    { issueRef: '8', targetDirArg: '/repo', serverUrl: 'http://server', configPath: DEFAULT_CONFIG_PATH },
+    {
+      execFn: commands.execFn,
+      loadConfigFn: async () => ({ billingMode: 'openrouter', modelStrategy: 'tiered' }),
+      preflightServerFn: async () => {},
+      preflightSubscriptionFn: async () => { subscriptionCalls += 1; },
+      resolveStageModelsFn: async () => {
+        resolveCalls += 1;
+        return snapshot;
+      },
+      runPipelineFn: async (input) => {
+        pipelineInput = input;
+        return 0;
+      },
+    }
+  );
+  assert.equal(resolveCalls, 1);
+  assert.equal(subscriptionCalls, 0);
+  assert.equal(pipelineInput.resolvedStageModelsArg, snapshot);
+  assert.equal(pipelineInput.configPath, DEFAULT_CONFIG_PATH);
+});
+
+test('runIssuePipeline: OpenRouter pricing failure happens before branch creation', async () => {
+  const repository = {
+    nameWithOwner: 'acme/app',
+    url: 'https://github.com/acme/app',
+    defaultBranchRef: { name: 'main' },
+  };
+  const issue = {
+    number: 8,
+    title: 'Add retries',
+    body: '',
+    url: 'https://github.com/acme/app/issues/8',
+    state: 'OPEN',
+    labels: [],
+    comments: [],
+  };
+  const commands = commandStub([
+    { command: 'git', args: ['rev-parse', '--show-toplevel'], stdout: '/repo\n' },
+    { command: 'git', args: ['status', '--porcelain'] },
+    { command: 'git', args: ['branch', '--show-current'], stdout: 'main\n' },
+    { command: 'git', args: ['remote', 'get-url', 'origin'], stdout: 'origin\n' },
+    { command: 'gh', args: ['repo', 'view', '--json', 'nameWithOwner,url,defaultBranchRef'], stdout: JSON.stringify(repository) },
+    { command: 'gh', args: ['issue', 'view', '8', '--repo', 'acme/app', '--json', 'number,title,body,url,state,labels,comments'], stdout: JSON.stringify(issue) },
+  ]);
+  await assert.rejects(
+    () => runIssuePipeline(
+      { issueRef: '8', targetDirArg: '/repo', serverUrl: 'http://server', configPath: DEFAULT_CONFIG_PATH },
+      {
+        execFn: commands.execFn,
+        loadConfigFn: async () => ({ billingMode: 'openrouter', modelStrategy: 'tiered' }),
+        preflightServerFn: async () => {},
+        resolveStageModelsFn: async () => { throw new Error('pricing unavailable'); },
+      }
+    ),
+    /pricing unavailable/
+  );
+  assert.equal(commands.calls.length, 6);
+});
+
 test('loadConfig: defaults stageTiers and maxRetries', async () => {
   const dir = await mkdtemp(path.join(os.tmpdir(), 'pipeline-config-'));
   try {
@@ -364,6 +838,19 @@ test('resolveStageModels: fixed GPT mapping never fetches OpenRouter pricing', a
     Object.fromEntries(Object.entries(resolved).map(([stage, value]) => [stage, value.model])),
     GPT_STAGE_MODELS
   );
+});
+
+test('resolveStageModelsIfNeeded: preserves a preflight snapshot without resolving again', async () => {
+  const snapshot = { plan: { model: 'a' }, execute: { model: 'b' }, review: { model: 'c' } };
+  let calls = 0;
+  const resolved = await resolveStageModelsIfNeeded({}, snapshot, {
+    resolveFn: async () => {
+      calls += 1;
+      return {};
+    },
+  });
+  assert.equal(resolved, snapshot);
+  assert.equal(calls, 0);
 });
 
 test('GPT preflight: rejects disconnected OpenAI', () => {

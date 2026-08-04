@@ -15,7 +15,7 @@ import path from 'node:path';
 import readline from 'node:readline';
 import { promisify } from 'node:util';
 import { pathToFileURL } from 'node:url';
-import { PIPELINE_STAGES, loadConfig } from './config.mjs';
+import { DEFAULT_CONFIG_PATH, PIPELINE_STAGES, loadConfig } from './config.mjs';
 import { fetchPricing, resolveTierModel } from './resolve-model.mjs';
 
 const execFileAsync = promisify(execFile);
@@ -46,6 +46,12 @@ const AGENT_BY_STAGE = {
   plan: 'pipeline-plan',
   execute: 'pipeline-execute',
   review: 'pipeline-review',
+};
+
+const AGENT_PROMPT_CONTRACTS = {
+  'pipeline-plan': ['PLAN_RESULT: READY', 'PLAN_RESULT: BLOCKED: <reason>'],
+  'pipeline-execute': ['EXECUTE_RESULT: COMPLETE', 'EXECUTE_RESULT: BLOCKED: <reason>'],
+  'pipeline-review': ['REQUIRED_FIXES:', 'REVIEW_RESULT: PASS', 'REVIEW_RESULT: FAIL: <short, specific, actionable reason>'],
 };
 
 function splitModelId(model) {
@@ -133,10 +139,10 @@ function validateChatGptSubscriptionProvider(registry, stageModels) {
   return true;
 }
 
-async function preflightChatGptSubscription(serverUrl, dir, stageModels) {
+async function preflightChatGptSubscription(serverUrl, dir, stageModels, { fetchFn = fetch } = {}) {
   let res;
   try {
-    res = await fetch(`${serverUrl}/provider?directory=${encodeURIComponent(dir)}`);
+    res = await fetchFn(`${serverUrl}/provider?directory=${encodeURIComponent(dir)}`);
   } catch (error) {
     throw subscriptionPreflightError([`could not query OpenCode's provider registry: ${error.message}`]);
   }
@@ -150,6 +156,58 @@ async function preflightChatGptSubscription(serverUrl, dir, stageModels) {
     throw subscriptionPreflightError([`OpenCode's provider registry did not return valid JSON`]);
   }
   validateChatGptSubscriptionProvider(registry, stageModels);
+}
+
+function pipelineAgentError(reasons) {
+  const detail = reasons.map((reason) => `  - ${reason}`).join('\n');
+  return new Error(
+    `Pipeline server preflight failed:\n${detail}\n\n` +
+      'Run `node setup.mjs`, restart `opencode serve`, and retry.'
+  );
+}
+
+function validatePipelineAgents(agents) {
+  if (!Array.isArray(agents)) throw pipelineAgentError(['OpenCode returned a malformed agent list']);
+  const reasons = [];
+  for (const [name, markers] of Object.entries(AGENT_PROMPT_CONTRACTS)) {
+    const agent = agents.find((candidate) => candidate?.name === name);
+    if (!agent) {
+      reasons.push(`${name} is not loaded`);
+      continue;
+    }
+    for (const marker of markers) {
+      if (typeof agent.prompt !== 'string' || !agent.prompt.includes(marker)) {
+        reasons.push(`${name} is stale or missing prompt contract ${marker}`);
+      }
+    }
+  }
+  if (reasons.length > 0) throw pipelineAgentError(reasons);
+  return true;
+}
+
+async function preflightExistingPipelineServer(serverUrl, dir, { fetchFn = fetch } = {}) {
+  let health;
+  try {
+    health = await fetchFn(`${serverUrl}/global/health`);
+  } catch (error) {
+    throw pipelineAgentError([`could not reach ${serverUrl}: ${error.message}`]);
+  }
+  if (!health.ok) throw pipelineAgentError([`${serverUrl}/global/health returned HTTP ${health.status}`]);
+
+  let response;
+  try {
+    response = await fetchFn(`${serverUrl}/agent?directory=${encodeURIComponent(dir)}`);
+  } catch (error) {
+    throw pipelineAgentError([`could not query loaded agents: ${error.message}`]);
+  }
+  if (!response.ok) throw pipelineAgentError([`OpenCode agent list returned HTTP ${response.status}`]);
+  let agents;
+  try {
+    agents = await response.json();
+  } catch {
+    throw pipelineAgentError(['OpenCode agent list did not return valid JSON']);
+  }
+  return validatePipelineAgents(agents);
 }
 
 async function resolveStageModels(config, { fetchPricingFn = fetchPricing } = {}) {
@@ -166,6 +224,10 @@ async function resolveStageModels(config, { fetchPricingFn = fetchPricing } = {}
       return [stage, resolveTierModel(tier, config.tiers, pricingMap)];
     })
   );
+}
+
+async function resolveStageModelsIfNeeded(config, resolved, { resolveFn = resolveStageModels } = {}) {
+  return resolved || resolveFn(config);
 }
 
 function formatStageDone(stage, result, billingMode, verdict = null) {
@@ -593,12 +655,19 @@ async function startServer(port) {
   return { child, url };
 }
 
-async function runPipeline({ task, targetDirArg, configPath } = {}) {
+async function runPipeline({
+  task,
+  targetDirArg,
+  configPath,
+  externalServerUrlArg,
+  preflightComplete = false,
+  resolvedStageModelsArg,
+} = {}) {
   if (!task) throw new Error('A task description is required');
   const dir = path.resolve(targetDirArg || process.cwd());
 
   const port = process.env.PIPELINE_SERVER_PORT || DEFAULT_SERVER_PORT;
-  const externalServerUrl = process.env.PIPELINE_SERVER_URL;
+  const externalServerUrl = externalServerUrlArg || process.env.PIPELINE_SERVER_URL;
 
   let serverHandle = null;
   let serverUrl = externalServerUrl;
@@ -624,12 +693,20 @@ async function runPipeline({ task, targetDirArg, configPath } = {}) {
   let exitCode = 0;
   try {
     const config = await loadConfig(configPath);
-    let resolved;
+    let resolved = resolvedStageModelsArg;
+    const modelsWerePreResolved = Boolean(resolvedStageModelsArg);
+    if (!preflightComplete) {
+      console.log('Verifying pipeline agents with OpenCode...');
+      await preflightExistingPipelineServer(serverUrl, dir);
+      console.log('Pipeline agents verified.\n');
+    }
     if (config.billingMode === 'chatgpt-subscription') {
-      resolved = await resolveStageModels(config);
-      console.log('Verifying ChatGPT subscription routing with OpenCode...');
-      await preflightChatGptSubscription(serverUrl, dir, config.stageModels);
-      console.log('ChatGPT subscription routing verified.\n');
+      resolved = await resolveStageModelsIfNeeded(config, resolved);
+      if (!preflightComplete) {
+        console.log('Verifying ChatGPT subscription routing with OpenCode...');
+        await preflightChatGptSubscription(serverUrl, dir, config.stageModels);
+        console.log('ChatGPT subscription routing verified.\n');
+      }
     }
 
     console.log(`\nAttach a TUI in another terminal:\n  opencode attach ${serverUrl}\n`);
@@ -651,8 +728,12 @@ async function runPipeline({ task, targetDirArg, configPath } = {}) {
     console.log(`Task: ${task}\n`);
 
     if (config.modelStrategy === 'tiered') {
-      console.log('Resolving models against live OpenRouter pricing...');
-      resolved = await resolveStageModels(config);
+      console.log(
+        modelsWerePreResolved
+          ? 'Using models resolved against live OpenRouter pricing during issue preflight...'
+          : 'Resolving models against live OpenRouter pricing...'
+      );
+      resolved = await resolveStageModelsIfNeeded(config, resolved);
       for (const stage of PIPELINE_STAGES) {
         const tier = config.stageTiers[stage];
         console.log(
@@ -756,13 +837,33 @@ async function runPipeline({ task, targetDirArg, configPath } = {}) {
   return exitCode;
 }
 
-async function runPipelineFromCli({ configPath, usage = 'node run-pipeline.mjs' } = {}) {
-  const [, , task, targetDirArg] = process.argv;
-  if (!task) {
-    console.error(`Usage: ${usage} "<task description>" [target-dir]`);
+async function runPipelineFromCli({
+  configPath,
+  command = 'opencode-pipeline',
+  args = process.argv.slice(2),
+  env = process.env,
+  runPipelineFn = runPipeline,
+  runIssuePipelineFn,
+} = {}) {
+  const launcher = await import('./issue-launcher.mjs');
+  const parsed = launcher.parsePipelineCliArgs(args);
+  if (parsed.mode === 'help') {
+    console.log(launcher.issueUsage(command));
+    console.log('\nIssue mode requires an existing OpenCode server and GitHub CLI authentication.');
+    return 0;
+  }
+  if (parsed.mode === 'error') {
+    console.error(`${parsed.message}\n\n${launcher.issueUsage(command)}`);
     return 1;
   }
-  return runPipeline({ task, targetDirArg, configPath });
+  if (parsed.mode === 'issue') {
+    const port = env.PIPELINE_SERVER_PORT || DEFAULT_SERVER_PORT;
+    const serverUrl = env.PIPELINE_SERVER_URL || `http://127.0.0.1:${port}`;
+    const issueConfigPath = configPath || env.PIPELINE_CONFIG || DEFAULT_CONFIG_PATH;
+    const launch = runIssuePipelineFn || launcher.runIssuePipeline;
+    return launch({ ...parsed, serverUrl, configPath: issueConfigPath });
+  }
+  return runPipelineFn({ task: parsed.task, targetDirArg: parsed.targetDirArg, configPath });
 }
 
 // True when this file is the entry point, including via a bin symlink (npm
@@ -791,7 +892,10 @@ export {
   collectWorkingTreeState,
   validateChatGptSubscriptionProvider,
   preflightChatGptSubscription,
+  validatePipelineAgents,
+  preflightExistingPipelineServer,
   resolveStageModels,
+  resolveStageModelsIfNeeded,
   formatStageDone,
   formatPipelineSummary,
   runPipeline,
