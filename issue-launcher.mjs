@@ -244,7 +244,13 @@ async function runIssuePipeline(
   const config = await loadConfigFn(configPath);
   await preflightServerFn(serverUrl, context.root, { fetchFn });
   if (config.billingMode === 'chatgpt-subscription') {
-    await preflightSubscriptionFn(serverUrl, context.root, config.stageModels, { fetchFn });
+    await preflightSubscriptionFn(
+      serverUrl,
+      context.root,
+      config.stageModels,
+      config.stageVariants,
+      { fetchFn }
+    );
   }
   const resolvedStageModels = await resolveStageModelsFn(config);
   const branch = await prepareIssueBranch(context, { execFn });

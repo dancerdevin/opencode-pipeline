@@ -99,7 +99,7 @@ function costMetadataIssue(cost) {
 // version number or local credential file. OpenCode exposes API-priced models
 // with nonzero cost metadata; ChatGPT OAuth rewrites subscription-backed model
 // costs to zero, which lets this command intentionally reject API-key routing.
-function validateChatGptSubscriptionProvider(registry, stageModels) {
+function validateChatGptSubscriptionProvider(registry, stageModels, stageVariants = {}) {
   const reasons = [];
   if (!registry || typeof registry !== 'object') {
     throw subscriptionPreflightError(['OpenCode returned a malformed provider registry']);
@@ -133,13 +133,31 @@ function validateChatGptSubscriptionProvider(registry, stageModels) {
     if (issue) {
       reasons.push(`${fullModel} does not have zero-valued subscription cost metadata (${issue})`);
     }
+    const variant = stageVariants[stage];
+    if (variant !== undefined && !model.variants?.[variant]) {
+      reasons.push(`${fullModel} does not expose the configured ${stage} variant "${variant}"`);
+    }
   }
 
   if (reasons.length > 0) throw subscriptionPreflightError(reasons);
   return true;
 }
 
-async function preflightChatGptSubscription(serverUrl, dir, stageModels, { fetchFn = fetch } = {}) {
+async function preflightChatGptSubscription(
+  serverUrl,
+  dir,
+  stageModels,
+  stageVariantsOrOptions = {},
+  options = {}
+) {
+  // Preserve the original exported signature where the fourth argument was
+  // `{ fetchFn }`, while allowing callers to pass stage variants explicitly.
+  let stageVariants = stageVariantsOrOptions;
+  if (typeof stageVariantsOrOptions?.fetchFn === 'function' && Object.keys(stageVariantsOrOptions).length === 1) {
+    options = stageVariantsOrOptions;
+    stageVariants = {};
+  }
+  const { fetchFn = fetch } = options;
   let res;
   try {
     res = await fetchFn(`${serverUrl}/provider?directory=${encodeURIComponent(dir)}`);
@@ -155,7 +173,7 @@ async function preflightChatGptSubscription(serverUrl, dir, stageModels, { fetch
   } catch {
     throw subscriptionPreflightError([`OpenCode's provider registry did not return valid JSON`]);
   }
-  validateChatGptSubscriptionProvider(registry, stageModels);
+  validateChatGptSubscriptionProvider(registry, stageModels, stageVariants);
 }
 
 function pipelineAgentError(reasons) {
@@ -213,7 +231,10 @@ async function preflightExistingPipelineServer(serverUrl, dir, { fetchFn = fetch
 async function resolveStageModels(config, { fetchPricingFn = fetchPricing } = {}) {
   if (config.modelStrategy === 'fixed') {
     return Object.fromEntries(
-      PIPELINE_STAGES.map((stage) => [stage, { model: config.stageModels[stage] }])
+      PIPELINE_STAGES.map((stage) => [stage, {
+        model: config.stageModels[stage],
+        ...(config.stageVariants?.[stage] ? { variant: config.stageVariants[stage] } : {}),
+      }])
     );
   }
 
@@ -245,7 +266,8 @@ function formatPipelineSummary(stageLog, totalCost, reviewResult, billingMode) {
       billingMode === 'chatgpt-subscription'
         ? 'ChatGPT subscription allowance'
         : `$${stage.cost.toFixed(6)}`;
-    lines.push(`  ${stage.stage.padEnd(16)} ${stage.model.padEnd(40)} ${usage}`);
+    const model = stage.variant ? `${stage.model} [effort=${stage.variant}]` : stage.model;
+    lines.push(`  ${stage.stage.padEnd(16)} ${model.padEnd(40)} ${usage}`);
   }
   if (billingMode === 'chatgpt-subscription') {
     lines.push('  billing: ChatGPT subscription allowance');
@@ -306,9 +328,15 @@ async function listPendingPermissions(serverUrl, dir, sessionId) {
   }
 }
 
-async function sendPrompt(serverUrl, dir, sessionId, { agent, model, prompt }) {
+async function sendPrompt(
+  serverUrl,
+  dir,
+  sessionId,
+  { agent, model, variant, prompt },
+  { fetchFn = fetch } = {}
+) {
   const { providerID, modelID } = splitModelId(model);
-  const res = await fetch(
+  const res = await fetchFn(
     `${serverUrl}/session/${sessionId}/prompt_async?directory=${encodeURIComponent(dir)}`,
     {
       method: 'POST',
@@ -316,6 +344,7 @@ async function sendPrompt(serverUrl, dir, sessionId, { agent, model, prompt }) {
       body: JSON.stringify({
         agent,
         model: { providerID, modelID },
+        ...(variant ? { variant } : {}),
         parts: [{ type: 'text', text: prompt }],
       }),
     }
@@ -519,7 +548,7 @@ function getStageResult(messages, previousAssistantIds) {
   return { text, cost };
 }
 
-async function runStage({ serverUrl, agent, model, dir, prompt, stageLabel, sessionId: existingSessionId }) {
+async function runStage({ serverUrl, agent, model, variant, dir, prompt, stageLabel, sessionId: existingSessionId }) {
   const sessionId = existingSessionId || await createSession(serverUrl, dir);
   const before = existingSessionId ? await getSessionMessages(serverUrl, dir, sessionId) : [];
   const previousAssistantIds = new Set(
@@ -533,7 +562,7 @@ async function runStage({ serverUrl, agent, model, dir, prompt, stageLabel, sess
   const stopWatchdog = startPermissionWatchdog(serverUrl, sessionId, stageLabel, dir);
   try {
     await selectSessionInTui(serverUrl, sessionId);
-    await sendPrompt(serverUrl, dir, sessionId, { agent, model, prompt });
+    await sendPrompt(serverUrl, dir, sessionId, { agent, model, variant, prompt });
     await waitForSessionIdle(stream, sessionId, STAGE_TIMEOUT_MS);
   } finally {
     stopWatchdog();
@@ -704,7 +733,7 @@ async function runPipeline({
       resolved = await resolveStageModelsIfNeeded(config, resolved);
       if (!preflightComplete) {
         console.log('Verifying ChatGPT subscription routing with OpenCode...');
-        await preflightChatGptSubscription(serverUrl, dir, config.stageModels);
+        await preflightChatGptSubscription(serverUrl, dir, config.stageModels, config.stageVariants);
         console.log('ChatGPT subscription routing verified.\n');
       }
     }
@@ -744,7 +773,8 @@ async function runPipeline({
     } else {
       console.log('Using fixed ChatGPT subscription models:');
       for (const stage of PIPELINE_STAGES) {
-        console.log(`  ${stage}: ${resolved[stage].model} (ChatGPT subscription allowance)`);
+        const variant = resolved[stage].variant ? `, effort=${resolved[stage].variant}` : '';
+        console.log(`  ${stage}: ${resolved[stage].model}${variant} (ChatGPT subscription allowance)`);
       }
     }
     console.log();
@@ -752,17 +782,19 @@ async function runPipeline({
     let totalCost = 0;
     const stageLog = [];
 
-    console.log(`[plan] running ${resolved.plan.model}...`);
+    const planVariant = resolved.plan.variant ? `, effort=${resolved.plan.variant}` : '';
+    console.log(`[plan] running ${resolved.plan.model}${planVariant}...`);
     const planResult = await runStage({
       serverUrl,
       agent: AGENT_BY_STAGE.plan,
       model: resolved.plan.model,
+      variant: resolved.plan.variant,
       dir,
       prompt: `Task: ${task}`,
       stageLabel: 'plan',
     });
     totalCost += planResult.cost;
-    stageLog.push({ stage: 'plan', model: resolved.plan.model, cost: planResult.cost });
+    stageLog.push({ stage: 'plan', model: resolved.plan.model, variant: resolved.plan.variant, cost: planResult.cost });
     console.log(`${formatStageDone('plan', planResult, config.billingMode)}\n`);
     const planStatus = parsePhaseResult(planResult.text, 'plan');
     if (planStatus.status !== 'READY') {
@@ -776,11 +808,13 @@ async function runPipeline({
     let attempt = 0;
 
     while (true) {
-      console.log(`[execute] running ${resolved.execute.model}${attempt > 0 ? ` (retry ${attempt})` : ''}...`);
+      const executeVariant = resolved.execute.variant ? `, effort=${resolved.execute.variant}` : '';
+      console.log(`[execute] running ${resolved.execute.model}${executeVariant}${attempt > 0 ? ` (retry ${attempt})` : ''}...`);
       executeResult = await runStage({
         serverUrl,
         agent: AGENT_BY_STAGE.execute,
         model: resolved.execute.model,
+        variant: resolved.execute.variant,
         dir,
         prompt: executePrompt,
         stageLabel: `execute${attempt > 0 ? `-retry${attempt}` : ''}`,
@@ -788,14 +822,15 @@ async function runPipeline({
       });
       executeSessionId = executeResult.sessionId;
       totalCost += executeResult.cost;
-      stageLog.push({ stage: `execute${attempt > 0 ? `-retry${attempt}` : ''}`, model: resolved.execute.model, cost: executeResult.cost });
+      stageLog.push({ stage: `execute${attempt > 0 ? `-retry${attempt}` : ''}`, model: resolved.execute.model, variant: resolved.execute.variant, cost: executeResult.cost });
       console.log(`${formatStageDone('execute', executeResult, config.billingMode)}\n`);
       const executeStatus = parsePhaseResult(executeResult.text, 'execute');
       if (executeStatus.status !== 'COMPLETE') {
         throw new Error(`[execute] blocked: ${executeStatus.reason}`);
       }
 
-      console.log(`[review] running ${resolved.review.model}${attempt > 0 ? ` (retry ${attempt})` : ''}...`);
+      const reviewVariant = resolved.review.variant ? `, effort=${resolved.review.variant}` : '';
+      console.log(`[review] running ${resolved.review.model}${reviewVariant}${attempt > 0 ? ` (retry ${attempt})` : ''}...`);
       const treeState = await collectWorkingTreeState(dir);
       const reviewPrompt =
         `Task: ${task}\n\nPlan:\n${planResult.text}\n\nExecute stage summary:\n${executeResult.text}\n\n` +
@@ -804,12 +839,13 @@ async function runPipeline({
         serverUrl,
         agent: AGENT_BY_STAGE.review,
         model: resolved.review.model,
+        variant: resolved.review.variant,
         dir,
         prompt: reviewPrompt,
         stageLabel: `review${attempt > 0 ? `-retry${attempt}` : ''}`,
       });
       totalCost += rawReview.cost;
-      stageLog.push({ stage: `review${attempt > 0 ? `-retry${attempt}` : ''}`, model: resolved.review.model, cost: rawReview.cost });
+      stageLog.push({ stage: `review${attempt > 0 ? `-retry${attempt}` : ''}`, model: resolved.review.model, variant: resolved.review.variant, cost: rawReview.cost });
       reviewResult = parseReviewResult(rawReview.text);
       console.log(`${formatStageDone('review', rawReview, config.billingMode, reviewResult.verdict)}\n`);
       // The verdict used to be all the operator saw; print the reviewer's full
@@ -896,6 +932,7 @@ export {
   preflightExistingPipelineServer,
   resolveStageModels,
   resolveStageModelsIfNeeded,
+  sendPrompt,
   formatStageDone,
   formatPipelineSummary,
   runPipeline,

@@ -18,6 +18,7 @@ import {
   preflightExistingPipelineServer,
   resolveStageModels,
   resolveStageModelsIfNeeded,
+  sendPrompt,
   formatStageDone,
   formatPipelineSummary,
   runPipelineFromCli,
@@ -39,9 +40,15 @@ import { resolveTierModel } from '../resolve-model.mjs';
 const execFileAsync = promisify(execFile);
 
 const GPT_STAGE_MODELS = {
-  plan: 'openai/gpt-5.6-terra',
+  plan: 'openai/gpt-5.6-sol',
   execute: 'openai/gpt-5.6-luna',
   review: 'openai/gpt-5.6-sol',
+};
+
+const GPT_STAGE_VARIANTS = {
+  plan: 'high',
+  execute: 'max',
+  review: 'high',
 };
 
 function subscriptionRegistry({ connected = ['openai'], missing = [], costs = {} } = {}) {
@@ -52,6 +59,7 @@ function subscriptionRegistry({ connected = ['openai'], missing = [], costs = {}
     models[modelID] = {
       id: modelID,
       providerID: 'openai',
+      variants: Object.fromEntries(['none', 'low', 'medium', 'high', 'xhigh', 'max'].map((variant) => [variant, {}])),
       cost: Object.hasOwn(costs, modelID)
         ? costs[modelID]
         : { input: 0, output: 0, cache: { read: 0, write: 0 } },
@@ -732,11 +740,12 @@ test('loadConfig: missing file is an error', async () => {
   await assert.rejects(() => loadConfig('/nonexistent/pipeline.config.json'), /Could not read/);
 });
 
-test('loadConfig: bundled GPT config pins Terra, Luna, and Sol', async () => {
+test('loadConfig: bundled GPT config pins the requested models and variants', async () => {
   const config = await loadConfig(GPT_CONFIG_PATH);
   assert.equal(config.modelStrategy, 'fixed');
   assert.equal(config.billingMode, 'chatgpt-subscription');
   assert.deepEqual(config.stageModels, GPT_STAGE_MODELS);
+  assert.deepEqual(config.stageVariants, GPT_STAGE_VARIANTS);
   assert.equal(config.maxRetries, 2);
 });
 
@@ -840,6 +849,34 @@ test('resolveStageModels: fixed GPT mapping never fetches OpenRouter pricing', a
   );
 });
 
+test('sendPrompt: forwards the configured OpenCode model variant', async () => {
+  let request;
+  await sendPrompt(
+    'http://server',
+    '/repo',
+    'session-1',
+    {
+      agent: 'pipeline-plan',
+      model: 'openai/gpt-5.6-sol',
+      variant: 'high',
+      prompt: 'Task: test',
+    },
+    {
+      fetchFn: async (url, options) => {
+        request = { url, options };
+        return response({ ok: true });
+      },
+    }
+  );
+  assert.equal(request.url, 'http://server/session/session-1/prompt_async?directory=%2Frepo');
+  assert.deepEqual(JSON.parse(request.options.body), {
+    agent: 'pipeline-plan',
+    model: { providerID: 'openai', modelID: 'gpt-5.6-sol' },
+    variant: 'high',
+    parts: [{ type: 'text', text: 'Task: test' }],
+  });
+});
+
 test('resolveStageModelsIfNeeded: preserves a preflight snapshot without resolving again', async () => {
   const snapshot = { plan: { model: 'a' }, execute: { model: 'b' }, review: { model: 'c' } };
   let calls = 0;
@@ -875,7 +912,7 @@ test('GPT preflight: rejects missing cost metadata', () => {
   assert.throws(
     () =>
       validateChatGptSubscriptionProvider(
-        subscriptionRegistry({ costs: { 'gpt-5.6-terra': undefined } }),
+        subscriptionRegistry({ costs: { 'gpt-5.6-sol': undefined } }),
         GPT_STAGE_MODELS
       ),
     /cost metadata is missing/
@@ -899,6 +936,22 @@ test('GPT preflight: rejects nonzero API-key pricing', () => {
 
 test('GPT preflight: accepts connected models with zero subscription costs', () => {
   assert.equal(validateChatGptSubscriptionProvider(subscriptionRegistry(), GPT_STAGE_MODELS), true);
+});
+
+test('GPT preflight: accepts configured reasoning variants', () => {
+  assert.equal(
+    validateChatGptSubscriptionProvider(subscriptionRegistry(), GPT_STAGE_MODELS, GPT_STAGE_VARIANTS),
+    true
+  );
+});
+
+test('GPT preflight: rejects an unavailable reasoning variant', () => {
+  const registry = subscriptionRegistry();
+  delete registry.all[0].models['gpt-5.6-luna'].variants.max;
+  assert.throws(
+    () => validateChatGptSubscriptionProvider(registry, GPT_STAGE_MODELS, GPT_STAGE_VARIANTS),
+    /gpt-5\.6-luna does not expose the configured execute variant "max"/
+  );
 });
 
 test('GPT output: reports subscription allowance without a dollar receipt', () => {

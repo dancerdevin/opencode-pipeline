@@ -10,7 +10,7 @@ canonical user-facing doc; this file is the operator/maintainer cheat sheet.
 A **plan → execute → review** pipeline over OpenCode with two public commands.
 `opencode-pipeline` keeps the cost-aware OpenRouter workflow: each stage uses a
 model tier resolved against *live* pricing. `opencode-gpt-pipeline` uses fixed
-Terra/Luna/Sol models through ChatGPT subscription authentication. Both share
+stage models and reasoning-effort variants through ChatGPT subscription authentication. Both share
 the same sessions, permissions, review, and retry machinery. The execute
 stage's `bash` calls surface in a human-attached TUI for live approval.
 
@@ -32,8 +32,9 @@ dependency clearly earns its place.
 - `setup.mjs` — installs/uninstalls the three `pipeline-*` agents as markdown
   files under `~/.config/opencode/agents/` (honors `XDG_CONFIG_HOME`).
 - `pipeline.config.json` — tier lists, stage→tier mapping, `maxRetries`.
-- `gpt-pipeline.config.json` — fixed Terra/Luna/Sol mapping and subscription
-  billing mode; do not make it fall back to other providers or models.
+- `gpt-pipeline.config.json` — fixed stage model/variant mapping and
+  subscription billing mode; do not make it fall back to other providers or
+  models.
 - `prompts/` — stage system prompts, embedded into the installed agents.
 - `test/pipeline.test.mjs` — `node:test` suite.
 

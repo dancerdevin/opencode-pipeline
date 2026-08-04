@@ -66,7 +66,7 @@ opencode-pipeline/
 ├── resolve-model.mjs     # cheapest-per-tier resolver against OpenRouter live pricing
 ├── setup.mjs             # installs the three pipeline agents into your opencode config
 ├── pipeline.config.json  # model tiers, stage → tier mapping, retry cap
-├── gpt-pipeline.config.json # fixed Terra/Luna/Sol mapping, subscription billing
+├── gpt-pipeline.config.json # fixed stage model/variant mapping, subscription billing
 ├── prompts/              # stage system prompts (plan / execute / review)
 └── test/                 # node:test suite for the harness logic
 ```
@@ -350,15 +350,22 @@ strategy is `tiered` and billing mode is `openrouter`.
 
 ### Fixed GPT configuration
 
-`gpt-pipeline.config.json` is bundled with the package:
+`gpt-pipeline.config.json` is bundled with the package. OpenCode calls the
+reasoning-effort setting a model `variant`; `stageVariants` is optional for
+fixed configs and is validated against the connected provider before a run:
 
 ```json
 {
   "modelStrategy": "fixed",
   "stageModels": {
-    "plan": "openai/gpt-5.6-terra",
+    "plan": "openai/gpt-5.6-sol",
     "execute": "openai/gpt-5.6-luna",
     "review": "openai/gpt-5.6-sol"
+  },
+  "stageVariants": {
+    "plan": "high",
+    "execute": "max",
+    "review": "high"
   },
   "billingMode": "chatgpt-subscription",
   "maxRetries": 2
@@ -366,9 +373,10 @@ strategy is `tiered` and billing mode is `openrouter`.
 ```
 
 Fixed configs require all three stages and cannot contain `tiers` or
-`stageTiers`; tiered configs cannot contain `stageModels`. The dedicated GPT
-command always uses this bundled file, so `PIPELINE_CONFIG` continues to affect
-the original OpenRouter command without changing GPT's fixed model contract.
+`stageTiers`; tiered configs cannot contain `stageModels` or `stageVariants`. The
+dedicated GPT command always uses this bundled file, so `PIPELINE_CONFIG`
+continues to affect the original OpenRouter command without changing GPT's
+fixed model contract.
 
 ### Prompts
 
@@ -421,17 +429,17 @@ their sentinels directly.
 GPT mode reports allowance usage instead of a dollar receipt:
 
 ```text
-[plan] running openai/gpt-5.6-terra...
+[plan] running openai/gpt-5.6-sol, effort=high...
 [plan] done (ChatGPT subscription allowance)
-[execute] running openai/gpt-5.6-luna...
+[execute] running openai/gpt-5.6-luna, effort=max...
 [execute] done (ChatGPT subscription allowance)
-[review] running openai/gpt-5.6-sol...
+[review] running openai/gpt-5.6-sol, effort=high...
 [review] done (ChatGPT subscription allowance) -> PASS
 
 --- Pipeline summary ---
-  plan             openai/gpt-5.6-terra                     ChatGPT subscription allowance
-  execute          openai/gpt-5.6-luna                      ChatGPT subscription allowance
-  review           openai/gpt-5.6-sol                       ChatGPT subscription allowance
+  plan             openai/gpt-5.6-sol [effort=high]          ChatGPT subscription allowance
+  execute          openai/gpt-5.6-luna [effort=max]           ChatGPT subscription allowance
+  review           openai/gpt-5.6-sol [effort=high]           ChatGPT subscription allowance
   billing: ChatGPT subscription allowance
   result: PASS
 ```

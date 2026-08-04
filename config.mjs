@@ -39,12 +39,20 @@ function requireStageMap(value, field, configPath) {
   return Object.fromEntries(PIPELINE_STAGES.map((stage) => [stage, value[stage]]));
 }
 
+function loadOptionalStageVariants(value, configPath) {
+  if (value === undefined) return {};
+  return requireStageMap(value, 'stageVariants', configPath);
+}
+
 function loadTieredConfig(config, configPath) {
   if (config.stageModels !== undefined) {
     throw configError(configPath, 'cannot mix "stageModels" with the tiered model strategy');
   }
   if (config.billingMode !== undefined && config.billingMode !== 'openrouter') {
     throw configError(configPath, 'must use billingMode "openrouter" with the tiered model strategy');
+  }
+  if (config.stageVariants !== undefined) {
+    throw configError(configPath, 'cannot define "stageVariants" with the tiered model strategy');
   }
   if (!config.tiers || typeof config.tiers !== 'object' || Array.isArray(config.tiers) || Object.keys(config.tiers).length === 0) {
     throw configError(configPath, 'must define a non-empty "tiers" object');
@@ -80,6 +88,7 @@ function loadFixedConfig(config, configPath) {
     throw configError(configPath, 'must use billingMode "chatgpt-subscription" with the fixed model strategy');
   }
   const stageModels = requireStageMap(config.stageModels, 'stageModels', configPath);
+  const stageVariants = loadOptionalStageVariants(config.stageVariants, configPath);
   for (const [stage, model] of Object.entries(stageModels)) {
     if (!/^[^/\s]+\/\S+$/.test(model)) {
       throw configError(configPath, `must define "stageModels.${stage}" as a provider/model ID`);
@@ -89,6 +98,7 @@ function loadFixedConfig(config, configPath) {
     modelStrategy: 'fixed',
     billingMode: 'chatgpt-subscription',
     stageModels,
+    stageVariants,
     maxRetries: loadMaxRetries(config.maxRetries, configPath),
   };
 }
