@@ -69,6 +69,14 @@ function subscriptionPreflightError(reasons) {
   return new Error(`GPT subscription preflight failed:\n${detail}\n\n${CHATGPT_LOGIN_INSTRUCTIONS}`);
 }
 
+function openRouterPreflightError(reasons) {
+  const detail = reasons.map((reason) => `  - ${reason}`).join('\n');
+  return new Error(
+    `OpenRouter model preflight failed:\n${detail}\n\n` +
+      'Verify OpenRouter authentication, model availability, and configured effort variants, then restart opencode serve and retry.'
+  );
+}
+
 function costMetadataIssue(cost) {
   if (!cost || typeof cost !== 'object' || Array.isArray(cost)) {
     return 'cost metadata is missing';
@@ -143,6 +151,52 @@ function validateChatGptSubscriptionProvider(registry, stageModels, stageVariant
   return true;
 }
 
+function validateOpenRouterProvider(registry, resolvedStageModels) {
+  const reasons = [];
+  if (!registry || typeof registry !== 'object') {
+    throw openRouterPreflightError(['OpenCode returned a malformed provider registry']);
+  }
+  if (!Array.isArray(registry.connected) || !registry.connected.includes('openrouter')) {
+    reasons.push('OpenRouter is not connected through OpenCode');
+  }
+
+  const openrouter = Array.isArray(registry.all)
+    ? registry.all.find((provider) => provider?.id === 'openrouter')
+    : null;
+  if (!openrouter) {
+    reasons.push('the OpenRouter provider is missing from OpenCode\'s provider registry');
+  }
+
+  for (const stage of PIPELINE_STAGES) {
+    const resolved = resolvedStageModels?.[stage];
+    const fullModel = resolved?.model;
+    if (typeof fullModel !== 'string') {
+      reasons.push(`${stage} has no resolved OpenRouter model`);
+      continue;
+    }
+    const { providerID, modelID } = splitModelId(fullModel);
+    if (providerID !== 'openrouter') {
+      reasons.push(`${stage} model ${fullModel} is not routed through the OpenRouter provider`);
+      continue;
+    }
+    const model = openrouter?.models?.[modelID];
+    if (!model) {
+      reasons.push(`${fullModel} is not available from the connected OpenRouter provider`);
+      continue;
+    }
+    if (model.status && model.status !== 'active') {
+      reasons.push(`${fullModel} is not active in the connected OpenRouter provider (status: ${model.status})`);
+      continue;
+    }
+    if (resolved.variant !== undefined && !model.variants?.[resolved.variant]) {
+      reasons.push(`${fullModel} does not expose the configured ${stage} variant "${resolved.variant}"`);
+    }
+  }
+
+  if (reasons.length > 0) throw openRouterPreflightError(reasons);
+  return true;
+}
+
 async function preflightChatGptSubscription(
   serverUrl,
   dir,
@@ -174,6 +228,30 @@ async function preflightChatGptSubscription(
     throw subscriptionPreflightError([`OpenCode's provider registry did not return valid JSON`]);
   }
   validateChatGptSubscriptionProvider(registry, stageModels, stageVariants);
+}
+
+async function preflightOpenRouterProvider(
+  serverUrl,
+  dir,
+  resolvedStageModels,
+  { fetchFn = fetch } = {}
+) {
+  let res;
+  try {
+    res = await fetchFn(`${serverUrl}/provider?directory=${encodeURIComponent(dir)}`);
+  } catch (error) {
+    throw openRouterPreflightError([`could not query OpenCode's provider registry: ${error.message}`]);
+  }
+  if (!res.ok) {
+    throw openRouterPreflightError([`OpenCode's provider registry returned HTTP ${res.status}`]);
+  }
+  let registry;
+  try {
+    registry = await res.json();
+  } catch {
+    throw openRouterPreflightError(['OpenCode\'s provider registry did not return valid JSON']);
+  }
+  validateOpenRouterProvider(registry, resolvedStageModels);
 }
 
 function pipelineAgentError(reasons) {
@@ -242,7 +320,9 @@ async function resolveStageModels(config, { fetchPricingFn = fetchPricing } = {}
   return Object.fromEntries(
     PIPELINE_STAGES.map((stage) => {
       const tier = config.stageTiers[stage];
-      return [stage, resolveTierModel(tier, config.tiers, pricingMap)];
+      const variant = config.stageVariants?.[stage];
+      const resolved = resolveTierModel(tier, config.tiers, pricingMap, { requiredVariant: variant });
+      return [stage, { ...resolved, ...(variant ? { variant } : {}) }];
     })
   );
 }
@@ -763,10 +843,16 @@ async function runPipeline({
           : 'Resolving models against live OpenRouter pricing...'
       );
       resolved = await resolveStageModelsIfNeeded(config, resolved);
+      if (!preflightComplete) {
+        console.log('Verifying OpenRouter model routing with OpenCode...');
+        await preflightOpenRouterProvider(serverUrl, dir, resolved);
+        console.log('OpenRouter model routing verified.\n');
+      }
       for (const stage of PIPELINE_STAGES) {
         const tier = config.stageTiers[stage];
+        const variant = resolved[stage].variant ? `, effort=${resolved[stage].variant}` : '';
         console.log(
-          `  ${stage} (tier=${tier}): ${resolved[stage].model} ` +
+          `  ${stage} (tier=${tier}): ${resolved[stage].model}${variant} ` +
             `(prompt $${resolved[stage].price.prompt}/tok, completion $${resolved[stage].price.completion}/tok)`
         );
       }
@@ -928,6 +1014,8 @@ export {
   collectWorkingTreeState,
   validateChatGptSubscriptionProvider,
   preflightChatGptSubscription,
+  validateOpenRouterProvider,
+  preflightOpenRouterProvider,
   validatePipelineAgents,
   preflightExistingPipelineServer,
   resolveStageModels,

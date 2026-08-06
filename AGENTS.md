@@ -31,7 +31,7 @@ dependency clearly earns its place.
   prints what would be picked right now).
 - `setup.mjs` — installs/uninstalls the three `pipeline-*` agents as markdown
   files under `~/.config/opencode/agents/` (honors `XDG_CONFIG_HOME`).
-- `pipeline.config.json` — tier lists, stage→tier mapping, `maxRetries`.
+- `pipeline.config.json` — tier lists, stage→tier/variant mapping, `maxRetries`.
 - `gpt-pipeline.config.json` — fixed stage model/variant mapping and
   subscription billing mode; do not make it fall back to other providers or
   models.
@@ -44,7 +44,7 @@ dependency clearly earns its place.
 node --test                 # full suite (also: npm test)
 node --check run-pipeline.mjs
 node --check run-gpt-pipeline.mjs
-node resolve-model.mjs smart   # sanity-check tier resolution against live pricing
+node resolve-model.mjs planner-review high # sanity-check tier/effort resolution against live pricing
 ```
 
 After editing `prompts/`: re-run `node setup.mjs` **and restart any running
@@ -81,6 +81,11 @@ After editing `prompts/`: re-run `node setup.mjs` **and restart any running
   exist, and their cost metadata must be zero. Nonzero costs indicate API-key
   routing and must be rejected. Never add an API-key, OpenRouter, or model
   fallback to the GPT command.
+- **OpenRouter model preflight is fail-closed.** Before any OpenRouter stage
+  runs, the selected models must be present and active in the connected
+  OpenRouter provider, and every configured stage variant must be exposed by
+  that model. Tier resolution must filter live OpenRouter candidates by the
+  requested reasoning effort instead of selecting an unsupported model.
 - **Loaded-agent preflight is contract-aware.** `/agent` must expose all three
   pipeline agents and their current plan/execute/review sentinel text before a
   stage starts. A stale server fails with setup/restart guidance instead of
@@ -91,10 +96,11 @@ After editing `prompts/`: re-run `node setup.mjs` **and restart any running
   `origin/<default>`. It never commits, pushes, opens PRs, reuses an existing
   issue branch implicitly, or changes an explicitly selected feature branch.
 - **Issue model resolution happens before branching.** OpenRouter issue runs
-  resolve live pricing exactly once and pass that frozen stage-model snapshot
-  into the orchestrator; pricing failure must leave the current branch
-  untouched. GPT issue runs resolve fixed models and additionally perform the
-  subscription preflight. Billing output remains mode-specific.
+  resolve live pricing exactly once, validate the selected models and variants,
+  and pass that frozen stage-model snapshot into the orchestrator; pricing or
+  route-preflight failure must leave the current branch untouched. GPT issue
+  runs resolve fixed models and additionally perform the subscription
+  preflight. Billing output remains mode-specific.
 - **Billing output follows the mode.** OpenRouter runs keep per-stage and total
   dollar receipts. GPT runs name each stage/model and say `ChatGPT subscription
   allowance`; do not print dollar costs for GPT runs.

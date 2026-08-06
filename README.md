@@ -4,8 +4,9 @@ A **plan → execute → review** pipeline over [OpenCode](https://opencode.ai),
 with a human (you) approving shell commands live. It has two public commands:
 
 - `opencode-pipeline` keeps the original cost-aware OpenRouter workflow. Each
-  stage uses a model tier, and the cheapest configured model in that tier is
-  selected from OpenRouter's live pricing.
+  stage uses a model tier and optional reasoning-effort variant, and the
+  cheapest configured model in that tier that supports the requested variant
+  is selected from OpenRouter's live pricing.
 - `opencode-gpt-pipeline` uses a ChatGPT Plus/Pro subscription with fixed GPT
   models: Terra for plan, Luna for execute, and Sol for review. It never queries
   OpenRouter pricing and never falls back to an API key or another model.
@@ -41,8 +42,9 @@ subscription allowance` without dollar costs.
 
 OpenRouter's [Auto router](https://openrouter.ai/docs/features/model-routing) picks a
 model **per prompt**, opaquely. This pipeline picks **per stage, deterministically**:
-you curate the tier lists in `pipeline.config.json`, the cheapest listed model that
-OpenRouter currently prices wins, and the choice is printed before anything runs.
+you curate the tier lists and optional effort variants in `pipeline.config.json`, the
+cheapest listed model that OpenRouter currently prices and supports wins, and the
+choice is printed before anything runs.
 Different stages get different quality floors — cheap for execution, your strongest
 model for review — which per-prompt routing can't express.
 
@@ -65,7 +67,7 @@ opencode-pipeline/
 ├── config.mjs            # tiered/fixed config loading and validation
 ├── resolve-model.mjs     # cheapest-per-tier resolver against OpenRouter live pricing
 ├── setup.mjs             # installs the three pipeline agents into your opencode config
-├── pipeline.config.json  # model tiers, stage → tier mapping, retry cap
+├── pipeline.config.json  # model tiers, stage → tier/variant mapping, retry cap
 ├── gpt-pipeline.config.json # fixed stage model/variant mapping, subscription billing
 ├── prompts/              # stage system prompts (plan / execute / review)
 └── test/                 # node:test suite for the harness logic
@@ -187,8 +189,9 @@ unreachable, the selected model route cannot preflight, or the running server
 has missing/stale pipeline prompts. It sends the issue title, body, labels, and
 all comments to the plan stage without model-generated summarization.
 
-The OpenRouter command resolves its three models against live pricing before
-creating a branch, freezes that model snapshot for the run, and retains the
+The OpenRouter command resolves its three models and requested effort variants
+against live pricing before creating a branch, verifies the selected models and
+variants through OpenCode, freezes that snapshot for the run, and retains the
 normal dollar receipt. `PIPELINE_CONFIG` overrides continue to apply. The GPT
 command performs its subscription-routing check instead and retains its
 allowance-only output.
@@ -325,23 +328,27 @@ diff and a clean local test run before you open the PR.
 ```json
 {
   "tiers": {
-    "cheap":      ["anthropic/claude-sonnet-5", "openai/gpt-5.6-terra", "google/gemini-3.1-pro-preview"],
-    "smart":      ["anthropic/claude-opus-4.8", "openai/gpt-5.6-sol", "moonshotai/kimi-k3"],
-    "very-smart": ["anthropic/claude-fable-5", "openai/gpt-5.5-pro"]
+    "planner-review": ["openai/gpt-5.6-sol", "anthropic/claude-opus-5"],
+    "implementation": ["openai/gpt-5.6-luna"]
   },
-  "stageTiers": { "plan": "smart", "execute": "cheap", "review": "very-smart" },
+  "stageTiers": { "plan": "planner-review", "execute": "implementation", "review": "planner-review" },
+  "stageVariants": { "plan": "high", "execute": "max", "review": "high" },
   "maxRetries": 2
 }
 ```
 
 - **tiers** — your candidate lists; IDs must match OpenRouter's catalog exactly.
-  The cheapest listed model that OpenRouter currently prices wins (blended score,
-  weighting completion 4× prompt since coding is output-heavy). Add your own
-  tiers and point stages at them. Only `tiers` is required; `stageTiers` and
-  `maxRetries` fall back to the defaults shown.
+  The cheapest listed model that OpenRouter currently prices and advertises as
+  supporting the stage's requested variant wins (blended score, weighting
+  completion 4× prompt since coding is output-heavy). Add your own tiers and
+  point stages at them. Only `tiers` is required; `stageTiers`, `stageVariants`,
+  and `maxRetries` fall back to the defaults shown.
+- **stageVariants** — optional OpenCode model-variant names, such as `high` or
+  `max`, applied independently to plan, execute, and review. The selected model
+  must expose the requested variant through the connected OpenRouter provider.
 - Check what would be chosen right now without running anything:
   ```bash
-  node resolve-model.mjs smart
+  node resolve-model.mjs planner-review high
   ```
 - `PIPELINE_CONFIG` points at a different config file if you keep several.
 
@@ -373,10 +380,10 @@ fixed configs and is validated against the connected provider before a run:
 ```
 
 Fixed configs require all three stages and cannot contain `tiers` or
-`stageTiers`; tiered configs cannot contain `stageModels` or `stageVariants`. The
-dedicated GPT command always uses this bundled file, so `PIPELINE_CONFIG`
-continues to affect the original OpenRouter command without changing GPT's
-fixed model contract.
+`stageTiers`; tiered configs cannot contain `stageModels`, but may define
+`stageVariants`. The dedicated GPT command always uses this bundled file, so
+`PIPELINE_CONFIG` continues to affect the original OpenRouter command without
+changing GPT's fixed model contract.
 
 ### Prompts
 
@@ -504,10 +511,10 @@ node --check run-pipeline.mjs
 node --check run-gpt-pipeline.mjs
 ```
 
-The harness's fiddly bits — review-sentinel parsing, tier resolution, config
-loading, fixed-model resolution, subscription preflight, billing output, and
-permission reply commands — are unit-tested. Zero dependencies; please keep it
-that way unless a dependency earns its place.
+The harness's fiddly bits — review-sentinel parsing, tier and effort resolution,
+config loading, fixed-model resolution, OpenRouter/GPT provider preflight,
+billing output, and permission reply commands — are unit-tested. Zero
+dependencies; please keep it that way unless a dependency earns its place.
 
 ## License
 

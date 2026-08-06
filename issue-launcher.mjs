@@ -8,6 +8,7 @@ import { loadConfig } from './config.mjs';
 import {
   preflightChatGptSubscription,
   preflightExistingPipelineServer,
+  preflightOpenRouterProvider,
   resolveStageModels,
   runPipeline,
 } from './run-pipeline.mjs';
@@ -236,6 +237,7 @@ async function runIssuePipeline(
     loadConfigFn = loadConfig,
     preflightServerFn = preflightExistingPipelineServer,
     preflightSubscriptionFn = preflightChatGptSubscription,
+    preflightOpenRouterFn = preflightOpenRouterProvider,
     resolveStageModelsFn = resolveStageModels,
     runPipelineFn = runPipeline,
   } = {}
@@ -253,6 +255,9 @@ async function runIssuePipeline(
     );
   }
   const resolvedStageModels = await resolveStageModelsFn(config);
+  if (config.billingMode === 'openrouter') {
+    await preflightOpenRouterFn(serverUrl, context.root, resolvedStageModels, { fetchFn });
+  }
   const branch = await prepareIssueBranch(context, { execFn });
 
   console.log(`GitHub issue: ${context.issue.url}`);

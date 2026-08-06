@@ -51,9 +51,6 @@ function loadTieredConfig(config, configPath) {
   if (config.billingMode !== undefined && config.billingMode !== 'openrouter') {
     throw configError(configPath, 'must use billingMode "openrouter" with the tiered model strategy');
   }
-  if (config.stageVariants !== undefined) {
-    throw configError(configPath, 'cannot define "stageVariants" with the tiered model strategy');
-  }
   if (!config.tiers || typeof config.tiers !== 'object' || Array.isArray(config.tiers) || Object.keys(config.tiers).length === 0) {
     throw configError(configPath, 'must define a non-empty "tiers" object');
   }
@@ -71,11 +68,13 @@ function loadTieredConfig(config, configPath) {
 
   const stageTiers = { ...DEFAULT_STAGE_TIERS, ...(config.stageTiers || {}) };
   requireStageMap(stageTiers, 'stageTiers', configPath);
+  const stageVariants = loadOptionalStageVariants(config.stageVariants, configPath);
   return {
     modelStrategy: 'tiered',
     billingMode: 'openrouter',
     tiers: config.tiers,
     stageTiers,
+    stageVariants,
     maxRetries: loadMaxRetries(config.maxRetries, configPath),
   };
 }

@@ -14,6 +14,8 @@ import {
   formatWorkingTreeState,
   collectWorkingTreeState,
   validateChatGptSubscriptionProvider,
+  validateOpenRouterProvider,
+  preflightOpenRouterProvider,
   validatePipelineAgents,
   preflightExistingPipelineServer,
   resolveStageModels,
@@ -51,6 +53,18 @@ const GPT_STAGE_VARIANTS = {
   review: 'high',
 };
 
+const OPENROUTER_STAGE_MODELS = {
+  plan: 'openrouter/openai/gpt-5.6-sol',
+  execute: 'openrouter/openai/gpt-5.6-luna',
+  review: 'openrouter/anthropic/claude-opus-5',
+};
+
+const OPENROUTER_STAGE_VARIANTS = {
+  plan: 'high',
+  execute: 'max',
+  review: 'high',
+};
+
 function subscriptionRegistry({ connected = ['openai'], missing = [], costs = {} } = {}) {
   const models = {};
   for (const fullModel of Object.values(GPT_STAGE_MODELS)) {
@@ -68,6 +82,26 @@ function subscriptionRegistry({ connected = ['openai'], missing = [], costs = {}
   return {
     connected,
     all: [{ id: 'openai', models }],
+  };
+}
+
+function openRouterRegistry({ connected = ['openrouter'], missing = [], variants = {} } = {}) {
+  const models = {};
+  for (const fullModel of Object.values(OPENROUTER_STAGE_MODELS)) {
+    const modelID = fullModel.slice('openrouter/'.length);
+    if (missing.includes(modelID)) continue;
+    models[modelID] = {
+      id: modelID,
+      providerID: 'openrouter',
+      status: 'active',
+      variants: Object.fromEntries(
+        Object.entries({ high: {}, max: {}, ...variants[modelID] }).filter(([, value]) => value !== false)
+      ),
+    };
+  }
+  return {
+    connected,
+    all: [{ id: 'openrouter', models }],
   };
 }
 
@@ -255,6 +289,26 @@ test('resolveTierModel: unknown tier throws', () => {
 
 test('resolveTierModel: throws when nothing in the tier is currently priced', () => {
   assert.throws(() => resolveTierModel('cheap', { cheap: ['a/gone'] }, new Map()), /not currently listed|No models in tier/);
+});
+
+test('resolveTierModel: filters candidates by requested reasoning effort before pricing', () => {
+  const tiers = { smart: ['a/cheap-no-high', 'a/expensive-high'] };
+  const pricing = new Map([
+    ['a/cheap-no-high', { prompt: 0.1, completion: 0.1, reasoning: { supported_efforts: ['low'] } }],
+    ['a/expensive-high', { prompt: 1, completion: 1, reasoning: { supported_efforts: ['high', 'max'] } }],
+  ]);
+  const winner = resolveTierModel('smart', tiers, pricing, { requiredVariant: 'high' });
+  assert.equal(winner.model, 'openrouter/a/expensive-high');
+});
+
+test('resolveTierModel: rejects a tier with no model supporting the requested effort', () => {
+  const pricing = new Map([
+    ['a/model', { prompt: 1, completion: 1, reasoning: { supported_efforts: ['high'] } }],
+  ]);
+  assert.throws(
+    () => resolveTierModel('smart', { smart: ['a/model'] }, pricing, { requiredVariant: 'max' }),
+    /supporting reasoning effort "max"/
+  );
 });
 
 test('permissionReplyCommand: includes directory-scoped URL, request id, and reply', () => {
@@ -630,6 +684,7 @@ test('runIssuePipeline: OpenRouter resolves pricing once, skips GPT preflight, a
   const snapshot = { plan: { model: 'a' }, execute: { model: 'b' }, review: { model: 'c' } };
   let resolveCalls = 0;
   let subscriptionCalls = 0;
+  let routePreflightCalls = 0;
   let pipelineInput;
   await runIssuePipeline(
     { issueRef: '8', targetDirArg: '/repo', serverUrl: 'http://server', configPath: DEFAULT_CONFIG_PATH },
@@ -638,6 +693,12 @@ test('runIssuePipeline: OpenRouter resolves pricing once, skips GPT preflight, a
       loadConfigFn: async () => ({ billingMode: 'openrouter', modelStrategy: 'tiered' }),
       preflightServerFn: async () => {},
       preflightSubscriptionFn: async () => { subscriptionCalls += 1; },
+      preflightOpenRouterFn: async (serverUrl, dir, resolved) => {
+        routePreflightCalls += 1;
+        assert.equal(serverUrl, 'http://server');
+        assert.equal(dir, '/repo');
+        assert.equal(resolved, snapshot);
+      },
       resolveStageModelsFn: async () => {
         resolveCalls += 1;
         return snapshot;
@@ -650,6 +711,7 @@ test('runIssuePipeline: OpenRouter resolves pricing once, skips GPT preflight, a
   );
   assert.equal(resolveCalls, 1);
   assert.equal(subscriptionCalls, 0);
+  assert.equal(routePreflightCalls, 1);
   assert.equal(pipelineInput.resolvedStageModelsArg, snapshot);
   assert.equal(pipelineInput.configPath, DEFAULT_CONFIG_PATH);
 });
@@ -692,6 +754,45 @@ test('runIssuePipeline: OpenRouter pricing failure happens before branch creatio
   assert.equal(commands.calls.length, 6);
 });
 
+test('runIssuePipeline: OpenRouter model preflight failure happens before branch creation', async () => {
+  const repository = {
+    nameWithOwner: 'acme/app',
+    url: 'https://github.com/acme/app',
+    defaultBranchRef: { name: 'main' },
+  };
+  const issue = {
+    number: 8,
+    title: 'Add retries',
+    body: '',
+    url: 'https://github.com/acme/app/issues/8',
+    state: 'OPEN',
+    labels: [],
+    comments: [],
+  };
+  const commands = commandStub([
+    { command: 'git', args: ['rev-parse', '--show-toplevel'], stdout: '/repo\n' },
+    { command: 'git', args: ['status', '--porcelain'] },
+    { command: 'git', args: ['branch', '--show-current'], stdout: 'main\n' },
+    { command: 'git', args: ['remote', 'get-url', 'origin'], stdout: 'origin\n' },
+    { command: 'gh', args: ['repo', 'view', '--json', 'nameWithOwner,url,defaultBranchRef'], stdout: JSON.stringify(repository) },
+    { command: 'gh', args: ['issue', 'view', '8', '--repo', 'acme/app', '--json', 'number,title,body,url,state,labels,comments'], stdout: JSON.stringify(issue) },
+  ]);
+  await assert.rejects(
+    () => runIssuePipeline(
+      { issueRef: '8', targetDirArg: '/repo', serverUrl: 'http://server', configPath: DEFAULT_CONFIG_PATH },
+      {
+        execFn: commands.execFn,
+        loadConfigFn: async () => ({ billingMode: 'openrouter', modelStrategy: 'tiered' }),
+        preflightServerFn: async () => {},
+        resolveStageModelsFn: async () => ({ plan: { model: 'a' }, execute: { model: 'b' }, review: { model: 'c' } }),
+        preflightOpenRouterFn: async () => { throw new Error('model route unavailable'); },
+      }
+    ),
+    /model route unavailable/
+  );
+  assert.equal(commands.calls.length, 6);
+});
+
 test('loadConfig: defaults stageTiers and maxRetries', async () => {
   const dir = await mkdtemp(path.join(os.tmpdir(), 'pipeline-config-'));
   try {
@@ -702,6 +803,7 @@ test('loadConfig: defaults stageTiers and maxRetries', async () => {
     assert.equal(config.billingMode, 'openrouter');
     assert.deepEqual(config.tiers, { cheap: ['a/x'] });
     assert.deepEqual(config.stageTiers, { plan: 'smart', execute: 'cheap', review: 'very-smart' });
+    assert.deepEqual(config.stageVariants, {});
     assert.equal(config.maxRetries, 2);
   } finally {
     await rm(dir, { recursive: true, force: true });
@@ -723,6 +825,43 @@ test('loadConfig: explicit stageTiers and maxRetries win', async () => {
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
+});
+
+test('loadConfig: tiered configs accept per-stage reasoning variants', async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'pipeline-config-'));
+  try {
+    const p = path.join(dir, 'pipeline.config.json');
+    await writeFile(
+      p,
+      JSON.stringify({
+        tiers: { reasoning: ['a/x'], implementation: ['a/y'] },
+        stageTiers: { plan: 'reasoning', execute: 'implementation', review: 'reasoning' },
+        stageVariants: { plan: 'high', execute: 'max', review: 'high' },
+      })
+    );
+    const config = await loadConfig(p);
+    assert.equal(config.modelStrategy, 'tiered');
+    assert.equal(config.billingMode, 'openrouter');
+    assert.deepEqual(config.stageVariants, { plan: 'high', execute: 'max', review: 'high' });
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('loadConfig: bundled OpenRouter config pins the requested tiers and variants', async () => {
+  const config = await loadConfig(DEFAULT_CONFIG_PATH);
+  assert.equal(config.modelStrategy, 'tiered');
+  assert.equal(config.billingMode, 'openrouter');
+  assert.deepEqual(config.tiers, {
+    'planner-review': ['openai/gpt-5.6-sol', 'anthropic/claude-opus-5'],
+    implementation: ['openai/gpt-5.6-luna'],
+  });
+  assert.deepEqual(config.stageTiers, {
+    plan: 'planner-review',
+    execute: 'implementation',
+    review: 'planner-review',
+  });
+  assert.deepEqual(config.stageVariants, OPENROUTER_STAGE_VARIANTS);
 });
 
 test('loadConfig: missing tiers is an error', async () => {
@@ -849,6 +988,40 @@ test('resolveStageModels: fixed GPT mapping never fetches OpenRouter pricing', a
   );
 });
 
+test('resolveStageModels: tiered OpenRouter mapping carries variants and filters unsupported candidates', async () => {
+  const config = {
+    modelStrategy: 'tiered',
+    stageTiers: {
+      plan: 'planner-review',
+      execute: 'implementation',
+      review: 'planner-review',
+    },
+    stageVariants: OPENROUTER_STAGE_VARIANTS,
+    tiers: {
+      'planner-review': ['openai/gpt-5.6-sol', 'anthropic/claude-opus-5'],
+      implementation: ['openai/gpt-5.6-luna'],
+    },
+  };
+  let pricingCalls = 0;
+  const resolved = await resolveStageModels(config, {
+    fetchPricingFn: async () => {
+      pricingCalls += 1;
+      return new Map([
+        ['openai/gpt-5.6-sol', { prompt: 1, completion: 1, reasoning: { supported_efforts: ['high', 'max'] } }],
+        ['anthropic/claude-opus-5', { prompt: 2, completion: 2, reasoning: { supported_efforts: ['high', 'max'] } }],
+        ['openai/gpt-5.6-luna', { prompt: 1, completion: 1, reasoning: { supported_efforts: ['max'] } }],
+      ]);
+    },
+  });
+  assert.equal(pricingCalls, 1);
+  assert.equal(resolved.plan.model, 'openrouter/openai/gpt-5.6-sol');
+  assert.equal(resolved.plan.variant, 'high');
+  assert.equal(resolved.execute.model, 'openrouter/openai/gpt-5.6-luna');
+  assert.equal(resolved.execute.variant, 'max');
+  assert.equal(resolved.review.model, 'openrouter/openai/gpt-5.6-sol');
+  assert.equal(resolved.review.variant, 'high');
+});
+
 test('sendPrompt: forwards the configured OpenCode model variant', async () => {
   let request;
   await sendPrompt(
@@ -895,6 +1068,32 @@ test('GPT preflight: rejects disconnected OpenAI', () => {
     () => validateChatGptSubscriptionProvider(subscriptionRegistry({ connected: ['openrouter'] }), GPT_STAGE_MODELS),
     /OpenAI is not connected[\s\S]*opencode auth login/
   );
+});
+
+test('sendPrompt: forwards OpenRouter model IDs and variants', async () => {
+  let request;
+  await sendPrompt(
+    'http://server',
+    '/repo',
+    'session-1',
+    {
+      agent: 'pipeline-execute',
+      model: 'openrouter/openai/gpt-5.6-luna',
+      variant: 'max',
+      prompt: 'Task: test',
+    },
+    {
+      fetchFn: async (url, options) => {
+        request = { url, options };
+        return response({ ok: true });
+      },
+    }
+  );
+  assert.deepEqual(JSON.parse(request.options.body).model, {
+    providerID: 'openrouter',
+    modelID: 'openai/gpt-5.6-luna',
+  });
+  assert.equal(JSON.parse(request.options.body).variant, 'max');
 });
 
 test('GPT preflight: rejects a missing required model', () => {
@@ -954,6 +1153,56 @@ test('GPT preflight: rejects an unavailable reasoning variant', () => {
   );
 });
 
+test('OpenRouter preflight: accepts connected resolved models and variants', () => {
+  const resolved = Object.fromEntries(
+    Object.entries(OPENROUTER_STAGE_MODELS).map(([stage, model]) => [stage, {
+      model,
+      variant: OPENROUTER_STAGE_VARIANTS[stage],
+    }])
+  );
+  assert.equal(validateOpenRouterProvider(openRouterRegistry(), resolved), true);
+});
+
+test('OpenRouter preflight: rejects a missing model or unavailable variant', () => {
+  const resolved = Object.fromEntries(
+    Object.entries(OPENROUTER_STAGE_MODELS).map(([stage, model]) => [stage, {
+      model,
+      variant: OPENROUTER_STAGE_VARIANTS[stage],
+    }])
+  );
+  assert.throws(
+    () => validateOpenRouterProvider(
+      openRouterRegistry({ missing: ['openai/gpt-5.6-luna'] }),
+      resolved
+    ),
+    /openai\/gpt-5\.6-luna is not available/
+  );
+  assert.throws(
+    () => validateOpenRouterProvider(
+      openRouterRegistry({ variants: { 'openai/gpt-5.6-luna': { max: false } } }),
+      resolved
+    ),
+    /gpt-5\.6-luna does not expose the configured execute variant "max"/
+  );
+});
+
+test('OpenRouter preflight: queries the directory-scoped provider registry', async () => {
+  const urls = [];
+  const resolved = Object.fromEntries(
+    Object.entries(OPENROUTER_STAGE_MODELS).map(([stage, model]) => [stage, {
+      model,
+      variant: OPENROUTER_STAGE_VARIANTS[stage],
+    }])
+  );
+  await preflightOpenRouterProvider('http://127.0.0.1:4747', '/repo path', resolved, {
+    fetchFn: async (url) => {
+      urls.push(url);
+      return response({ json: openRouterRegistry() });
+    },
+  });
+  assert.match(urls[0], /provider\?directory=%2Frepo%20path/);
+});
+
 test('GPT output: reports subscription allowance without a dollar receipt', () => {
   const result = { text: '', cost: 12.34 };
   const done = formatStageDone('plan', result, 'chatgpt-subscription');
@@ -979,4 +1228,15 @@ test('OpenRouter output: preserves stage and total dollar costs', () => {
   );
   assert.match(summary, /\$0\.125000/);
   assert.match(summary, /total cost/);
+});
+
+test('OpenRouter output: reports configured effort variants with dollar costs', () => {
+  const summary = formatPipelineSummary(
+    [{ stage: 'execute', model: OPENROUTER_STAGE_MODELS.execute, variant: 'max', cost: 0.25 }],
+    0.25,
+    { verdict: 'PASS', reason: null },
+    'openrouter'
+  );
+  assert.match(summary, /openrouter\/openai\/gpt-5\.6-luna \[effort=max\]/);
+  assert.match(summary, /total cost: \$0\.250000/);
 });
