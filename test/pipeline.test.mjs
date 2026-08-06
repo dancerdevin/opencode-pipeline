@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
-import { mkdtemp, writeFile, rm } from 'node:fs/promises';
+import { mkdtemp, writeFile, readFile, rm, stat } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 
@@ -24,7 +24,20 @@ import {
   formatStageDone,
   formatPipelineSummary,
   runPipelineFromCli,
+  resolveStageTimeouts,
+  resolveStageGraceMs,
+  resolveHeartbeatMs,
+  waitForSessionIdle,
+  StageTimeoutError,
+  runStage,
 } from '../run-pipeline.mjs';
+import {
+  createRunState,
+  formatRunStateStatus,
+  loadRunState,
+  runStatePath,
+  saveRunState,
+} from '../run-state.mjs';
 import {
   formatIssueTask,
   inspectIssueRun,
@@ -128,11 +141,11 @@ function commandStub(expected) {
 }
 
 const PIPELINE_AGENTS = [
-  { name: 'pipeline-plan', prompt: 'PLAN_RESULT: READY\nPLAN_RESULT: BLOCKED: <reason>' },
-  { name: 'pipeline-execute', prompt: 'EXECUTE_RESULT: COMPLETE\nEXECUTE_RESULT: BLOCKED: <reason>' },
+  { name: 'pipeline-plan', prompt: 'VERIFICATION_PLAN:\nPLAN_RESULT: READY\nPLAN_RESULT: BLOCKED: <reason>' },
+  { name: 'pipeline-execute', prompt: 'VERIFICATION_RESULT:\nEXECUTE_RESULT: COMPLETE\nEXECUTE_RESULT: BLOCKED: <reason>' },
   {
     name: 'pipeline-review',
-    prompt: 'REQUIRED_FIXES:\nREVIEW_RESULT: PASS\nREVIEW_RESULT: FAIL: <short, specific, actionable reason>',
+    prompt: 'REQUIRED_FIXES:\nNOTES:\nseverity: evidence: confidence:\nREVIEW_RESULT: PASS\nREVIEW_RESULT: FAIL: <short, specific, actionable reason>',
   },
 ];
 
@@ -186,11 +199,11 @@ test('parseReviewResult: last sentinel wins (FAIL after PASS)', () => {
 });
 
 test('parsePhaseResult: accepts final plan and execute success sentinels', () => {
-  assert.deepEqual(parsePhaseResult('1. Edit a.js.\nPLAN_RESULT: READY', 'plan'), {
+  assert.deepEqual(parsePhaseResult('1. Edit a.js.\nVERIFICATION_PLAN:\n- `npm test`\nPLAN_RESULT: READY', 'plan'), {
     status: 'READY',
     reason: null,
   });
-  assert.deepEqual(parsePhaseResult('Done.\nEXECUTE_RESULT: COMPLETE', 'execute'), {
+  assert.deepEqual(parsePhaseResult('Done.\nVERIFICATION_RESULT:\n- `npm test`: PASS\nEXECUTE_RESULT: COMPLETE', 'execute'), {
     status: 'COMPLETE',
     reason: null,
   });
@@ -201,6 +214,11 @@ test('parsePhaseResult: carries an explicit blocked reason', () => {
     status: 'BLOCKED',
     reason: 'missing approval',
   });
+});
+
+test('parsePhaseResult: requires the verification section on successful phases', () => {
+  assert.match(parsePhaseResult('PLAN_RESULT: READY', 'plan').reason, /VERIFICATION_PLAN/);
+  assert.match(parsePhaseResult('EXECUTE_RESULT: COMPLETE', 'execute').reason, /VERIFICATION_RESULT/);
 });
 
 test('parsePhaseResult: rejects a missing or non-final sentinel', () => {
@@ -318,6 +336,180 @@ test('permissionReplyCommand: includes directory-scoped URL, request id, and rep
   assert.match(cmd, /"reply":"once"/);
 });
 
+test('stage timeout settings: honor per-stage overrides and legacy global fallback', () => {
+  assert.deepEqual(resolveStageTimeouts({}), {
+    plan: 1_800_000,
+    execute: 3_600_000,
+    review: 1_800_000,
+  });
+  assert.deepEqual(resolveStageTimeouts({ PIPELINE_STAGE_TIMEOUT_MS: '1234' }), {
+    plan: 1234,
+    execute: 1234,
+    review: 1234,
+  });
+  assert.deepEqual(resolveStageTimeouts({
+    PIPELINE_STAGE_TIMEOUT_MS: '1234',
+    PIPELINE_EXECUTE_TIMEOUT_MS: '5678',
+  }), {
+    plan: 1234,
+    execute: 5678,
+    review: 1234,
+  });
+  assert.equal(resolveStageGraceMs({}), 300_000);
+  assert.equal(resolveHeartbeatMs({}), 30_000);
+});
+
+test('waitForSessionIdle: active work receives one bounded grace period', async () => {
+  async function* events() {
+    await new Promise((resolve) => setTimeout(resolve, 8));
+    yield { payload: { type: 'message.updated', properties: { sessionID: 'session-activity' } } };
+    await new Promise((resolve) => setTimeout(resolve, 8));
+    yield { payload: { type: 'session.idle', properties: { sessionID: 'session-activity' } } };
+  }
+  await waitForSessionIdle(events(), 'session-activity', {
+    stage: 'execute',
+    timeoutMs: 10,
+    graceMs: 20,
+    heartbeatMs: 5,
+  });
+});
+
+test('waitForSessionIdle: timeout includes session context and pending approvals', async () => {
+  const eventStream = {
+    [Symbol.asyncIterator]() {
+      return {
+        next: () => new Promise(() => {}),
+      };
+    },
+  };
+  await assert.rejects(
+    () => waitForSessionIdle(eventStream, 'session-timeout', {
+      stage: 'execute',
+      timeoutMs: 10,
+      graceMs: 10,
+      heartbeatMs: 5,
+      getPendingCount: () => 1,
+    }),
+    (error) => {
+      assert.ok(error instanceof StageTimeoutError);
+      assert.equal(error.sessionId, 'session-timeout');
+      assert.equal(error.stage, 'execute');
+      assert.equal(error.pendingPermissions, 1);
+      return true;
+    }
+  );
+});
+
+test('runStage: resume waits on the same session without a duplicate prompt', async () => {
+  const messages = [];
+  let sessionId = 'session-resume';
+  let eventController;
+  let promptCount = 0;
+  let completeOnResume = false;
+  const eventFor = (id) => `data: ${JSON.stringify({ payload: { type: 'session.idle', properties: { sessionID: id } } })}\n\n`;
+  const assistantText = 'VERIFICATION_RESULT:\n- `npm test`: PASS\nEXECUTE_RESULT: COMPLETE';
+  const fetchFn = async (url, options = {}) => {
+    const parsed = new URL(url);
+    if (parsed.pathname === '/session' && options.method === 'POST') {
+      return { ok: true, status: 200, json: async () => ({ id: sessionId }) };
+    }
+    if (parsed.pathname === '/permission') return { ok: true, status: 200, json: async () => [] };
+    if (parsed.pathname === '/tui/select-session') return { ok: true, status: 200, json: async () => ({}) };
+    if (parsed.pathname === '/global/event') {
+      const stream = new ReadableStream({
+        start(controller) {
+          eventController = controller;
+          if (completeOnResume) {
+            setTimeout(() => {
+              messages.push({ info: { id: 'assistant-resumed', role: 'assistant', cost: 0 }, parts: [{ type: 'text', text: assistantText }] });
+              controller.enqueue(new TextEncoder().encode(eventFor(sessionId)));
+              controller.close();
+            }, 5);
+          }
+        },
+      });
+      return { ok: true, status: 200, body: stream };
+    }
+    const messageMatch = parsed.pathname.match(/^\/session\/([^/]+)\/message$/);
+    if (messageMatch) return { ok: true, status: 200, json: async () => messages };
+    const promptMatch = parsed.pathname.match(/^\/session\/([^/]+)\/prompt_async$/);
+    if (promptMatch) {
+      promptCount += 1;
+      messages.push({ info: { id: `user-${promptCount}`, role: 'user' }, parts: [{ type: 'text', text: JSON.parse(options.body).parts[0].text }] });
+      return { ok: true, status: 200, text: async () => '' };
+    }
+    throw new Error(`unexpected fake fetch ${url}`);
+  };
+
+  let timeout;
+  await assert.rejects(
+    () => runStage({
+      serverUrl: 'http://server',
+      agent: 'pipeline-execute',
+      model: 'openai/gpt-5.6-luna',
+      variant: 'max',
+      dir: '/repo',
+      prompt: 'implement it',
+      stage: 'execute',
+      stageLabel: 'execute',
+      env: { PIPELINE_EXECUTE_TIMEOUT_MS: '10', PIPELINE_STAGE_GRACE_MS: '5', PIPELINE_HEARTBEAT_MS: '2' },
+      fetchFn,
+    }),
+    (error) => {
+      timeout = error;
+      return error instanceof StageTimeoutError;
+    }
+  );
+  assert.equal(timeout.sessionId, sessionId);
+  assert.equal(promptCount, 1);
+  completeOnResume = true;
+  const result = await runStage({
+    serverUrl: 'http://server',
+    agent: 'pipeline-execute',
+    model: 'openai/gpt-5.6-luna',
+    variant: 'max',
+    dir: '/repo',
+    prompt: 'implement it',
+    stage: 'execute',
+    stageLabel: 'execute',
+    sessionId,
+    resumeOnly: true,
+    env: { PIPELINE_EXECUTE_TIMEOUT_MS: '100', PIPELINE_STAGE_GRACE_MS: '5', PIPELINE_HEARTBEAT_MS: '2' },
+    fetchFn,
+  });
+  assert.match(result.text, /EXECUTE_RESULT: COMPLETE/);
+  assert.equal(promptCount, 1);
+  assert.ok(eventController);
+});
+
+test('run state: persists a private manifest and formats status/resume guidance', async () => {
+  const stateDir = await mkdtemp(path.join(os.tmpdir(), 'pipeline-state-'));
+  try {
+    const state = createRunState({ task: 'Fix it', targetDir: '/repo', branch: 'feature/fix' });
+    await saveRunState(state, { stateDir });
+    const loaded = await loadRunState(state.runId, { stateDir });
+    assert.equal(loaded.runId, state.runId);
+    assert.equal(await readFile(runStatePath(state.runId, { stateDir }), 'utf8').then((text) => text.endsWith('\n')), true);
+    assert.equal((await stat(runStatePath(state.runId, { stateDir }))).mode & 0o777, 0o600);
+    const status = formatRunStateStatus(loaded, { stateDir });
+    assert.match(status, new RegExp(`--resume ${state.runId}`));
+    assert.match(status, /feature\/fix/);
+  } finally {
+    await rm(stateDir, { recursive: true, force: true });
+  }
+});
+
+test('run state: rejects missing and corrupt manifests', async () => {
+  const stateDir = await mkdtemp(path.join(os.tmpdir(), 'pipeline-state-'));
+  try {
+    await assert.rejects(() => loadRunState('missing-run'), /not found/);
+    await writeFile(path.join(stateDir, 'corrupt-run.json'), '{bad');
+    await assert.rejects(() => loadRunState('corrupt-run', { stateDir }), /not valid JSON/);
+  } finally {
+    await rm(stateDir, { recursive: true, force: true });
+  }
+});
+
 test('issue CLI: parses issue numbers, URLs, legacy tasks, and help', () => {
   assert.deepEqual(parsePipelineCliArgs(['--issue', '123', '/repo']), {
     mode: 'issue',
@@ -329,6 +521,14 @@ test('issue CLI: parses issue numbers, URLs, legacy tasks, and help', () => {
     mode: 'task',
     task: 'fix the bug',
     targetDirArg: '/repo',
+  });
+  assert.deepEqual(parsePipelineCliArgs(['--status', 'run-123456']), {
+    mode: 'status',
+    runId: 'run-123456',
+  });
+  assert.deepEqual(parsePipelineCliArgs(['--resume', 'run-123456']), {
+    mode: 'resume',
+    runId: 'run-123456',
   });
   assert.deepEqual(parsePipelineCliArgs(['--help']), { mode: 'help' });
   assert.equal(parsePipelineCliArgs(['--issue', 'nope']).mode, 'error');
@@ -384,6 +584,42 @@ test('standard CLI: issue mode honors PIPELINE_CONFIG and defaults to OpenRouter
     },
   });
   assert.equal(defaultInput.configPath, DEFAULT_CONFIG_PATH);
+});
+
+test('standard CLI: status reads a manifest and resume forwards the run ID', async () => {
+  const stateDir = await mkdtemp(path.join(os.tmpdir(), 'pipeline-cli-state-'));
+  const state = createRunState({ task: 'Resume me', targetDir: '/repo', branch: 'feature/resume' });
+  try {
+    await saveRunState(state, { stateDir });
+    const originalLog = console.log;
+    let output = '';
+    console.log = (line) => { output += `${line}\n`; };
+    try {
+      const status = await runPipelineFromCli({
+        args: ['--status', state.runId],
+        env: { PIPELINE_STATE_DIR: stateDir },
+      });
+      assert.equal(status, 0);
+    } finally {
+      console.log = originalLog;
+    }
+    assert.match(output, new RegExp(`Pipeline run ${state.runId}`));
+
+    let resumeInput;
+    const resumed = await runPipelineFromCli({
+      args: ['--resume', state.runId],
+      env: { PIPELINE_STATE_DIR: stateDir },
+      runPipelineFn: async (input) => {
+        resumeInput = input;
+        return 0;
+      },
+    });
+    assert.equal(resumed, 0);
+    assert.equal(resumeInput.resumeRunId, state.runId);
+    assert.equal(resumeInput.command, 'opencode-pipeline');
+  } finally {
+    await rm(stateDir, { recursive: true, force: true });
+  }
 });
 
 test('issueBranchName: produces deterministic capped ASCII branch names', () => {

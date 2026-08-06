@@ -15,6 +15,7 @@
     "run-pipeline.mjs",
     "run-gpt-pipeline.mjs",
     "issue-launcher.mjs",
+    "run-state.mjs",
     "resolve-model.mjs",
     "config.mjs",
     "setup.mjs",

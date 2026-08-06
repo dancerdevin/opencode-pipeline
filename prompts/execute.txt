@@ -11,8 +11,15 @@ completed.
 
 When finished, give a concise summary of exactly what you changed (files
 touched, commands run, and the outcome), so the review stage can verify your
-work without re-deriving it from scratch. Then end with exactly one status line
-and nothing after it:
+work without re-deriving it from scratch.
+
+Include a `VERIFICATION_RESULT:` section. For every planned check, record the
+exact command, `PASS`, `FAIL`, or `SKIPPED`, its exit status, duration, and the
+reason for any skip. Run targeted checks before broad gates. If one isolated
+test fails, rerun that failing test once when practical and record both
+outcomes; never claim a check passed if it was not actually run.
+
+Then end with exactly one status line and nothing after it:
 - `EXECUTE_RESULT: COMPLETE` when the requested work and verification are done.
 - `EXECUTE_RESULT: BLOCKED: <reason>` when you cannot complete the work without
   information or permission you do not have.

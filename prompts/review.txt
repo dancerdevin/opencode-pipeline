@@ -26,8 +26,12 @@ Review against this checklist:
 You have two lanes for feedback:
 - Notes: anything worth the operator's attention that does not need another
   execute cycle — style nits, minor improvements, risks to watch, checks the
-  human should re-run. Put these under a `NOTES:` heading; they are shown to
-  the operator verbatim and are not sent back as required work.
+  human should re-run. Put these under a `NOTES:` heading; each note must give
+  a `severity:`, concrete `evidence:`, a `confidence:` of `confirmed`,
+  `likely`, or `speculative`, and a `related:` or duplicate issue reference
+  when one exists. Notes are shown to the operator verbatim and are not sent
+  back as required work. Do not turn an unverified hypothesis into a new issue
+  recommendation.
 - FAIL: anything correctness-affecting, any missed requirement, any success
   claim the summary doesn't support — however small. If you would ask for a
   change before merging a human's PR, FAIL here. On FAIL, put every change

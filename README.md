@@ -64,6 +64,7 @@ opencode-pipeline/
 ├── run-pipeline.mjs      # shared orchestrator + OpenRouter entry point
 ├── run-gpt-pipeline.mjs  # fixed-model ChatGPT subscription entry point
 ├── issue-launcher.mjs    # GitHub issue intake and safe branch preparation
+├── run-state.mjs         # private durable manifests for status/resume
 ├── config.mjs            # tiered/fixed config loading and validation
 ├── resolve-model.mjs     # cheapest-per-tier resolver against OpenRouter live pricing
 ├── setup.mjs             # installs the three pipeline agents into your opencode config
@@ -85,6 +86,12 @@ permissions:
 
 Only execute can ever prompt you. Plan and review are read-only and run without
 interruption.
+
+The plan stage records a `VERIFICATION_PLAN:` with exact commands. Execute
+reports those commands under `VERIFICATION_RESULT:` with outcomes and
+durations. Review notes include severity, evidence, confidence, and related
+issue context so speculative findings are easy to distinguish from confirmed
+follow-up work.
 
 ## Prerequisites
 
@@ -161,6 +168,19 @@ directory:
 PIPELINE_SERVER_URL=http://127.0.0.1:4747 \
   opencode-pipeline --issue 123 /path/to/target/repo
 ```
+
+Every run prints a run ID and a private state-file path. If the supervisor
+times out while a session is still active, inspect and resume that same run:
+
+```bash
+opencode-pipeline --status <run-id>
+opencode-pipeline --resume <run-id>
+```
+
+Resume reuses the existing OpenCode session and never sends a duplicate prompt,
+creates a branch, or mutates git. It requires the target to remain on the same
+branch and the original server to be available. Use the matching
+`opencode-gpt-pipeline` command for a GPT run.
 
 No `high` or `max` command-line arguments are required. The stage efforts come
 from `stageVariants` in the selected config. The pipeline preflights the
@@ -465,7 +485,13 @@ their sentinels directly.
 | `PIPELINE_SERVER_URL`             | *(unset)*       | Attach to an already-running server at this URL; skip spawn/teardown. Issue mode defaults it to localhost using `PIPELINE_SERVER_PORT`. |
 | `PIPELINE_SERVER_PORT`            | `4747`          | Port for the server the script spawns (ignored if `PIPELINE_SERVER_URL` is set). |
 | `PIPELINE_CONFIG`                 | `pipeline.config.json` next to the scripts | Path to the pipeline config file. |
-| `PIPELINE_STAGE_TIMEOUT_MS`       | `1800000` (30m) | How long a single stage may run before timing out. Generous because you may take time to approve. |
+| `PIPELINE_STAGE_TIMEOUT_MS`       | stage-specific | Legacy global timeout fallback for all stages. |
+| `PIPELINE_PLAN_TIMEOUT_MS`        | `1800000` (30m) | Base plan-stage timeout. |
+| `PIPELINE_EXECUTE_TIMEOUT_MS`     | `3600000` (60m) | Base execute-stage timeout. |
+| `PIPELINE_REVIEW_TIMEOUT_MS`      | `1800000` (30m) | Base review-stage timeout. |
+| `PIPELINE_STAGE_GRACE_MS`         | `300000` (5m) | One bounded extension when recent session activity or a pending approval is visible. |
+| `PIPELINE_HEARTBEAT_MS`           | `30000` (30s) | Liveness/status heartbeat interval. |
+| `PIPELINE_STATE_DIR`               | system temp directory | Directory for private resumable run manifests. |
 | `PIPELINE_PERMISSION_POLL_MS`     | `3000`          | How often the pipeline polls the server for pending approval asks while a stage runs. |
 | `PIPELINE_PERMISSION_REMINDER_MS` | `30000`         | How often an unanswered ask is re-announced in the pipeline's output. |
 
@@ -484,9 +510,9 @@ their sentinels directly.
 -----------------------
 
 --- Pipeline summary ---
-  plan             openrouter/moonshotai/kimi-k3          $0.010214
-  execute          openrouter/anthropic/claude-sonnet-5   $0.031755
-  review           openrouter/anthropic/claude-fable-5    $0.008430
+  plan             openrouter/moonshotai/kimi-k3          $0.010214 (12s)
+  execute          openrouter/anthropic/claude-sonnet-5   $0.031755 (2m 4s)
+  review           openrouter/anthropic/claude-fable-5    $0.008430 (18s)
   total cost: $0.050399
   result: PASS
 ```
@@ -500,11 +526,11 @@ GPT mode reports allowance usage instead of a dollar receipt:
 
 ```text
 [plan] running openai/gpt-5.6-sol, effort=high...
-[plan] done (ChatGPT subscription allowance)
+[plan] done in 12s (ChatGPT subscription allowance)
 [execute] running openai/gpt-5.6-luna, effort=max...
-[execute] done (ChatGPT subscription allowance)
+[execute] done in 2m 4s (ChatGPT subscription allowance)
 [review] running openai/gpt-5.6-sol, effort=high...
-[review] done (ChatGPT subscription allowance) -> PASS
+[review] done in 18s (ChatGPT subscription allowance) -> PASS
 
 --- Pipeline summary ---
   plan             openai/gpt-5.6-sol [effort=high]          ChatGPT subscription allowance
@@ -551,12 +577,16 @@ GPT mode reports allowance usage instead of a dollar receipt:
   subject to plan limits, and intentionally omit dollar-cost reporting.
 - **Scope tasks tightly.** One issue per run. A vague or sprawling task produces
   a vague plan and a shakier review verdict.
-- **If a stage ever hangs** past when the TUI clearly shows it finished, Ctrl-C
-  and re-run — but this shouldn't happen: each stage's `/global/event`
-  subscription is established (awaited) before its prompt is sent, so the
-  `session.idle` completion event can't be missed. If a stage legitimately runs
-  long (e.g. you stepped away before approving a command), raise
-  `PIPELINE_STAGE_TIMEOUT_MS`.
+- **If a stage runs long**, the log prints periodic liveness messages. Recent
+  session activity or an unanswered approval receives one bounded grace period.
+  If the stage still reaches its limit, the run is marked paused rather than
+  issuing a duplicate prompt. Use the printed `--status` and `--resume`
+  commands after checking the TUI and working tree. Each stage's
+  `/global/event` subscription is still established before its prompt, so a
+  fast `session.idle` event cannot be missed.
+- **Timeout compatibility:** stage-specific timeout variables override the
+  legacy `PIPELINE_STAGE_TIMEOUT_MS`; the legacy variable remains useful when
+  one limit should apply uniformly.
 
 ## Uninstall
 
@@ -572,6 +602,7 @@ Then delete the clone. Your OpenCode/OpenRouter login is untouched.
 node --test
 node --check run-pipeline.mjs
 node --check run-gpt-pipeline.mjs
+node --check run-state.mjs
 ```
 
 The harness's fiddly bits — review-sentinel parsing, tier and effort resolution,

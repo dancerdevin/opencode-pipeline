@@ -26,6 +26,8 @@ dependency clearly earns its place.
   `opencode-gpt-pipeline`.
 - `issue-launcher.mjs` — `--issue` intake, server preflight, and deterministic
   feature-branch preparation before delegating to the shared orchestrator.
+- `run-state.mjs` — private, atomic run manifests used by `--status` and
+  `--resume`; state lives outside the target checkout.
 - `config.mjs` — loader/validator for tiered and fixed-model configurations.
 - `resolve-model.mjs` — cheapest-per-tier resolver (`node resolve-model.mjs <tier>`
   prints what would be picked right now).
@@ -44,6 +46,7 @@ dependency clearly earns its place.
 node --test                 # full suite (also: npm test)
 node --check run-pipeline.mjs
 node --check run-gpt-pipeline.mjs
+node --check run-state.mjs
 node resolve-model.mjs planner-review high # sanity-check tier/effort resolution against live pricing
 ```
 
@@ -58,9 +61,11 @@ After editing `prompts/`: re-run `node setup.mjs` **and restart any running
   sentinel counts as FAIL. Anything the reviewer writes before the sentinel is
   printed to the operator verbatim (the notes lane) — keep the sentinel itself
   on the final line. Edit the prompt's wording around it carefully.
-- **Plan/execute sentinel contracts.** Plan must end with `PLAN_RESULT: READY`
+- **Plan/execute sentinel contracts.** Plan must include `VERIFICATION_PLAN:`
+  and end with `PLAN_RESULT: READY`
   or `PLAN_RESULT: BLOCKED: <reason>`; execute must end with
-  `EXECUTE_RESULT: COMPLETE` or `EXECUTE_RESULT: BLOCKED: <reason>`. The
+  `VERIFICATION_RESULT:` and `EXECUTE_RESULT: COMPLETE` or
+  `EXECUTE_RESULT: BLOCKED: <reason>`. The
   orchestrator does not advance an idle stage whose final line lacks its
   sentinel. On review failure, every required repair belongs in the bounded
   `REQUIRED_FIXES:` block; the summary after `FAIL:` is not the repair packet.
@@ -164,9 +169,23 @@ default branch is a terminal preflight failure for the supervisor to report.
 
 With `PIPELINE_SERVER_URL` set, the script attaches to the existing server and
 does not spawn/tear one down (and skips the "press Enter" pause). Run it in the
-background and poll the log; stages routinely take minutes, and the default
-per-stage timeout is 30 min (`PIPELINE_STAGE_TIMEOUT_MS`) to allow for slow
-human approvals. Exit code is 0 on PASS, 1 on FAIL.
+background and poll the log; stages routinely take minutes. Plan and review
+default to 30 min, execute defaults to 60 min, and recent activity or a
+pending approval receives one bounded five-minute grace period. Exit code is 0
+on PASS, 1 on FAIL or an incomplete/paused run.
+
+Every run prints a private state manifest and run ID. If a stage pauses, use
+the exact commands printed by the pipeline:
+
+```bash
+opencode-pipeline --status <run-id>
+opencode-pipeline --resume <run-id>
+```
+
+Resume re-preflights the existing server, verifies the recorded branch, and
+waits on or collects the existing session without sending a duplicate prompt.
+It does not repeat issue intake or branch preparation. Use the corresponding
+`opencode-gpt-pipeline` binary for GPT runs.
 
 Only the **execute** stage can prompt for approval (plan/review deny bash+edit
 and never prompt). Two command groups are pre-approved (see `EXECUTE_BASH_ALLOW`
@@ -220,12 +239,23 @@ Proven use case: the execute agent hunting for a test runner that isn't on
 instead of approving an endless series of `find /` probes. Peek at a session's
 recent activity via `GET /session/<id>/message?directory=<dir>`.
 
+If a stage reaches its limit, the pipeline prints liveness context and pauses
+the run instead of issuing a duplicate prompt. Inspect the TUI and working tree,
+then use the printed `--status` and `--resume` commands. Stage-specific timeout
+variables are `PIPELINE_PLAN_TIMEOUT_MS`, `PIPELINE_EXECUTE_TIMEOUT_MS`, and
+`PIPELINE_REVIEW_TIMEOUT_MS`; `PIPELINE_STAGE_TIMEOUT_MS` remains their
+backward-compatible global fallback.
+
 ### After the run
 
 - The review stage's full findings print after its verdict, then PASS/FAIL
   plus a per-stage usage table at the end; OpenRouter shows dollar costs and
   GPT mode shows ChatGPT subscription allowance. FAIL retries appear as
   `execute-retryN` / `review-retryN` rows, capped by `maxRetries`.
+- Plan output must include exact verification commands under
+  `VERIFICATION_PLAN:`. Execute output must report each command and its actual
+  result under `VERIFICATION_RESULT:`. Review notes should include severity,
+  evidence, confidence, and related/duplicate issue context.
 - **Triage the review findings before committing.** The notes lane produces
   claims too — verify each against the code before acting on it. (In the #135
   run, one of three notes was a false positive: the query options it flagged

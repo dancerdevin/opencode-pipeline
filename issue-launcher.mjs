@@ -22,6 +22,8 @@ function issueUsage(command = 'opencode-pipeline') {
   return [
     `Usage: ${command} "<task description>" [target-dir]`,
     `       ${command} --issue <number-or-url> [target-dir]`,
+    `       ${command} --status <run-id>`,
+    `       ${command} --resume <run-id>`,
   ].join('\n');
 }
 
@@ -32,6 +34,12 @@ function parsePipelineCliArgs(args) {
       return { mode: 'error', message: '--issue requires an issue number or GitHub issue URL' };
     }
     return { mode: 'issue', issueRef: args[1], targetDirArg: args[2] };
+  }
+  if (args[0] === '--status' || args[0] === '--resume') {
+    if (args.length !== 2 || !/^[A-Za-z0-9][A-Za-z0-9_-]{7,127}$/.test(args[1] || '')) {
+      return { mode: 'error', message: `${args[0]} requires a pipeline run ID` };
+    }
+    return { mode: args[0].slice(2), runId: args[1] };
   }
   if (args.length < 1 || args.length > 2 || args[0].startsWith('-')) {
     return { mode: 'error', message: 'a task description is required' };
@@ -230,7 +238,7 @@ async function prepareIssueBranch(context, { execFn = defaultExec } = {}) {
 }
 
 async function runIssuePipeline(
-  { issueRef, targetDirArg, serverUrl, configPath },
+  { issueRef, targetDirArg, serverUrl, configPath, command = 'opencode-pipeline' },
   {
     execFn = defaultExec,
     fetchFn = fetch,
@@ -269,6 +277,7 @@ async function runIssuePipeline(
     task: context.task,
     targetDirArg: context.root,
     configPath,
+    command,
     externalServerUrlArg: serverUrl,
     preflightComplete: true,
     resolvedStageModelsArg: resolvedStageModels,
