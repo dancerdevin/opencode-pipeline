@@ -129,6 +129,46 @@ opencode-gpt-pipeline --issue <number-or-url> [target-dir]
 The source-checkout equivalents are `node run-pipeline.mjs` and `node
 run-gpt-pipeline.mjs`.
 
+## OpenRouter quickstart
+
+The bundled `pipeline.config.json` is the effort-aware OpenRouter profile:
+planning and review use the `planner-review` tier at `high`, while execution
+uses the Luna-only `implementation` tier at `max`. The resolver checks live
+OpenRouter pricing and only considers configured models that advertise the
+requested effort variant.
+
+After OpenRouter is connected in OpenCode and the pipeline agents are
+installed, start a server and attach a TUI:
+
+```bash
+node setup.mjs                 # repeat after changing prompts or agents
+opencode serve --port 4747
+opencode attach http://127.0.0.1:4747
+```
+
+Then run the package command from a third terminal:
+
+```bash
+PIPELINE_SERVER_URL=http://127.0.0.1:4747 \
+  opencode-pipeline "<task>" /path/to/target/repo
+```
+
+From a source checkout, replace `opencode-pipeline` with
+`node run-pipeline.mjs`. For an issue, use the same server and target
+directory:
+
+```bash
+PIPELINE_SERVER_URL=http://127.0.0.1:4747 \
+  opencode-pipeline --issue 123 /path/to/target/repo
+```
+
+No `high` or `max` command-line arguments are required. The stage efforts come
+from `stageVariants` in the selected config. The pipeline preflights the
+loaded pipeline agents and their sentinel contracts, then verifies the
+selected OpenRouter models and variants through OpenCode before the first
+stage. Issue mode performs those checks before creating its deterministic
+feature branch.
+
 ## GPT subscription quickstart
 
 Authenticate OpenCode through ChatGPT OAuth, install the shared pipeline
@@ -346,6 +386,8 @@ diff and a clean local test run before you open the PR.
 - **stageVariants** — optional OpenCode model-variant names, such as `high` or
   `max`, applied independently to plan, execute, and review. The selected model
   must expose the requested variant through the connected OpenRouter provider.
+  If omitted, no explicit effort is sent and the provider/model default is
+  used. When present, all three stages must have an entry.
 - Check what would be chosen right now without running anything:
   ```bash
   node resolve-model.mjs planner-review high
@@ -354,6 +396,27 @@ diff and a clean local test run before you open the PR.
 
 Legacy tier configs without `modelStrategy` remain supported. Their normalized
 strategy is `tiered` and billing mode is `openrouter`.
+
+The broader tier configuration from the earlier version remains in Git history
+at commit `d58742f`; it is not the active bundled config. To inspect or run it
+as a separate profile:
+
+```bash
+git show d58742f:pipeline.config.json > /tmp/pipeline-legacy.config.json
+PIPELINE_CONFIG=/tmp/pipeline-legacy.config.json \
+  opencode-pipeline "<task>" /path/to/target/repo
+```
+
+That historical profile has no `stageVariants`, so it uses provider defaults.
+If you want its larger model arrays with explicit efforts, add this object to
+the copied config:
+
+```json
+"stageVariants": { "plan": "high", "execute": "max", "review": "high" }
+```
+
+The current OpenRouter preflight still applies to custom profiles; a historical
+model ID that is no longer available or active will fail before model work.
 
 ### Fixed GPT configuration
 
